@@ -10,7 +10,7 @@ import cliCursor from 'cli-cursor';
 import { downloadCourse, type DownloadMode, type DownloadSummary } from './index.js';
 import { login, getAuthStatus } from './auth.js';
 import { regenerateIndex } from './regenerate-index.js';
-import { updateYtDlp, rollbackYtDlp, getYtDlpPaths } from './downloader.js';
+import { updateYtDlp, rollbackYtDlp, getYtDlpPaths, findFfmpegCandidates, installBundledFfmpeg, FFMPEG_INSTALL_HINT } from './downloader.js';
 import { regenerateGroupIndex } from './regenerate-group-index.js';
 import { Scraper, type CourseLibraryResult, type CourseListItem } from './scraper.js';
 import type { Logger } from './logger.js';
@@ -179,6 +179,45 @@ function isClassroomRootUrl(value: string) {
     } catch {
         return false;
     }
+}
+
+/**
+ * Every video download needs ffmpeg, and without one each lesson fails on its
+ * own, so check before starting. With nothing usable, offer to fetch the
+ * bundled build: npm 12+ skips its install script unless package.json allows
+ * it, and the install also fails offline or behind a proxy.
+ */
+async function ensureFfmpeg(): Promise<boolean> {
+    if ((await findFfmpegCandidates()).length > 0) return true;
+
+    log.warn('No working ffmpeg was found. It is needed to merge the video and audio of most videos.');
+
+    if (!process.stdin.isTTY) {
+        console.error(`${FFMPEG_INSTALL_HINT}\nOr run "skool" in a terminal, which offers to download it.`);
+        return false;
+    }
+
+    const shouldDownload = await confirm({
+        message: 'Download ffmpeg now? (about 80 MB, the build for this system from the ffmpeg-static project)'
+    });
+    handleCancel(shouldDownload);
+
+    if (shouldDownload) {
+        const downloadSpinner = spinner();
+        downloadSpinner.start('Downloading ffmpeg...');
+        try {
+            const installed = await installBundledFfmpeg();
+            downloadSpinner.stop(`ffmpeg ready: ${installed}`);
+            log.info(pc.dim('A system ffmpeg (brew, winget or apt) is newer than this one and is used first once installed.'));
+            return true;
+        } catch (err) {
+            downloadSpinner.stop('Could not download ffmpeg.');
+            log.error(err instanceof Error ? err.message : String(err));
+        }
+    }
+
+    log.info(FFMPEG_INSTALL_HINT);
+    return false;
 }
 
 async function ensureLogin(): Promise<boolean> {
@@ -531,6 +570,11 @@ async function runInteractive() {
         return;
     }
 
+    if (!await ensureFfmpeg()) {
+        outro('ffmpeg is required for video downloads. Exiting.');
+        return;
+    }
+
     let concurrency = 8;
     if (actionValue === 'download-course' || actionValue === 'download-multi') {
         const concurrencyChoice = await select({
@@ -868,6 +912,10 @@ async function runWithArgs(args: CliArgs) {
         const loggedIn = await ensureLogin();
         if (!loggedIn) {
             console.log('Login required. Exiting.');
+            return;
+        }
+        if (!await ensureFfmpeg()) {
+            process.exitCode = 1;
             return;
         }
         if (isClassroomRootUrl(args.url)) {

@@ -33,9 +33,11 @@ This tool downloads video content, localizes images, preserves course attachment
 
 If `XDG_CACHE_HOME` is set, it wins on every platform. Set `SKOOL_DOWNLOADER_CACHE_DIR` to choose the folder yourself; it overrides everything else. Your `downloads/`, `.auth/` and `cookies.txt` stay in the directory you run the tool from.
 
-`ffmpeg` is what merges the separate video and audio streams that most high-quality sources deliver, so it is required for video downloads. It installs automatically through the `ffmpeg-static` package. npm 12 and later only run the install scripts of packages listed under `allowScripts` in `package.json`; `ffmpeg-static` is already listed there, so `npm install` still fetches the binary. If that install is blocked (an offline machine, a restrictive proxy, or an unsupported platform), install `ffmpeg` yourself and the tool will pick it up from your `PATH`.
+`ffmpeg` is what merges the separate video and audio streams that most high-quality sources deliver, so it is required for video downloads. It installs automatically through the `ffmpeg-static` package. npm 12 and later only run the install scripts of packages listed under `allowScripts` in `package.json`; `ffmpeg-static` is already listed there, so `npm install` still fetches the binary.
 
-Installing a system `ffmpeg` is worth it even when the bundled one works. The bundled build (ffmpeg 7.0.2) crashes on some Loom videos, and a system `ffmpeg` is the first thing the tool retries with. To use a specific build, point `SKOOL_FFMPEG_PATH` at it; it is tried before any other.
+Before downloading, the tool looks for every `ffmpeg` it can use (the bundled one and the one on your `PATH`), checks that each one runs, and uses the **newest version** first; the others are kept as fallbacks if a merge fails. If none is found, it says so and, in the interactive CLI, offers to download the bundled build for your system (about 80 MB).
+
+Installing a system `ffmpeg` is recommended: the bundled build (ffmpeg 7.0.2) crashes on some Loom videos, and a system one is usually newer, so it is picked first. To force a specific build, point `SKOOL_FFMPEG_PATH` at it; it always goes first.
 
 ```bash
 # macOS
