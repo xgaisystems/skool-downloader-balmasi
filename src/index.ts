@@ -1,5 +1,7 @@
-import { Scraper, Module } from './scraper.js';
-import { Downloader } from './downloader.js';
+import { Scraper, Module, type LinkedPost } from './scraper.js';
+import { Downloader, summarizeVideoError } from './downloader.js';
+import { LINKED_POSTS_CSS, renderLinkedPosts, type LinkedPostFile } from './linked-posts.js';
+import { renderLessonProgressScript } from './progress-sync.js';
 import { regenerateIndex } from './regenerate-index.js';
 import { regenerateGroupIndex } from './regenerate-group-index.js';
 import { createConsoleLogger, type Logger } from './logger.js';
@@ -21,20 +23,29 @@ function registerShutdownHandlers(logger: Logger) {
     shutdownHandlersRegistered = true;
 
     const handleShutdown = async (signal: string) => {
+        // 128 + signal number, what a shell reports for an interrupted command.
+        const exitCode = signal === 'SIGINT' ? 130 : 143;
         if (!activeOutputDir) {
-            process.exit(0);
+            process.exit(exitCode);
             return;
         }
         logger.warn(`\n🛑 Caught ${signal}. Regenerating index before exit...`);
+        const outputDir = activeOutputDir;
+        const groupDir = activeGroupDir;
         try {
-            await regenerateIndex(activeOutputDir);
-            if (activeGroupDir) {
-                await regenerateGroupIndex(activeGroupDir);
+            // Through the same queues as the regular regenerations, so this
+            // never writes index.html.tmp at the same time as one of them. The
+            // per-lesson ones still waiting are dropped: this one covers them.
+            indexLimit.clearQueue();
+            groupIndexLimit.clearQueue();
+            await indexLimit(() => regenerateIndex(outputDir, { patchLessons: false }));
+            if (groupDir) {
+                await groupIndexLimit(() => regenerateGroupIndex(groupDir));
             }
         } catch (err) {
             logger.error('⚠️ Failed to regenerate index during shutdown.', err);
         } finally {
-            process.exit(0);
+            process.exit(exitCode);
         }
     };
 
@@ -66,6 +77,7 @@ type LessonManifest = {
     lessonDirName: string;
     relativePath: string;
     hasVideo: boolean;
+    videoError?: string;
     resourcesCount: number;
     updatedAt: string;
 };
@@ -124,6 +136,15 @@ export type DownloadOptions = {
     runTasks?: (tasks: LessonTask[], concurrency: number) => Promise<void>;
 };
 
+export type LessonFailure = {
+    lessonTitle: string;
+    lessonUrl: string;
+    lessonDir: string;
+    kind: 'lesson' | 'video';
+    reason: string;
+    videoUrl?: string;
+};
+
 export type DownloadSummary = {
     courseName: string;
     groupName: string;
@@ -132,6 +153,8 @@ export type DownloadSummary = {
     lessonsCount: number;
     completedLessons: number;
     failedLessons: number;
+    failedVideos: number;
+    failures: LessonFailure[];
     targetLessonId: string | null;
 };
 
@@ -157,7 +180,36 @@ function getUrlExtension(url: string) {
 }
 
 function sanitizeName(value: string) {
-    return value.replace(/[/\\?%*:|"<>]/g, '-');
+    // Windows drops trailing dots and spaces from folder names, so "Title..." would not resolve.
+    return value.replace(/[/\\?%*:|"<>]/g, '-').replace(/[. ]+$/, '');
+}
+
+// Stored per post because members commonly upload files with the same name
+// (image.png, resumen.pdf). A failed download keeps the remote link instead.
+async function saveLinkedPostFiles(
+    post: LinkedPost,
+    lessonDir: string,
+    downloader: Downloader,
+    logger: Logger
+): Promise<LinkedPostFile[]> {
+    const postDirName = sanitizeName(post.name);
+    const usedNames = new Set<string>();
+
+    return Promise.all(post.attachments.map(async (attachment) => {
+        const name = attachment.file_name || attachment.title;
+        let fileName = sanitizeName(name) || attachment.file_id || 'attachment';
+        if (usedNames.has(fileName)) fileName = `${attachment.file_id}-${fileName}`;
+        usedNames.add(fileName);
+
+        const isImage = !!attachment.file_content_type?.startsWith('image/');
+        try {
+            await downloader.downloadAsset(attachment.downloadUrl!, path.join(lessonDir, 'posts', postDirName, fileName));
+            return { name, isImage, href: `posts/${encodeURIComponent(postDirName)}/${encodeURIComponent(fileName)}` };
+        } catch (err) {
+            logger.warn(`    ⚠️  Failed to download attachment "${name}" of post ${post.url}: ${String(err)}`);
+            return { name, isImage, href: attachment.downloadUrl! };
+        }
+    }));
 }
 
 function resolveTargetLessonId(
@@ -195,7 +247,7 @@ async function runConcurrent(tasks: Array<() => Promise<void>>, concurrency: num
     if (tasks.length === 0) return;
     if (concurrency <= 1 || tasks.length === 1) {
         for (const task of tasks) {
-            await task();
+            await task().catch(() => {});
         }
         return;
     }
@@ -207,7 +259,7 @@ async function runConcurrent(tasks: Array<() => Promise<void>>, concurrency: num
             const current = index;
             index += 1;
             if (current >= tasks.length) return;
-            await tasks[current]();
+            await tasks[current]().catch(() => {});
         }
     });
 
@@ -235,6 +287,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
 
     let completedLessons = 0;
     let failedLessons = 0;
+    const failures: LessonFailure[] = [];
 
     try {
         logger.info('🚀 Fetching course structure...');
@@ -409,6 +462,9 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
 
                         logger.info(`\n  📄 Processing [${mInfo.mIndex}.${lIndex}] ${lesson.title}`);
 
+                        // Thrown after the lesson is saved so task renderers show it
+                        // as failed instead of a green tick.
+                        let taskError: Error | null = null;
                         try {
                             updateStatus('Loading lesson data...');
                             await fs.ensureDir(lessonDir);
@@ -418,13 +474,24 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             const localizedHtml = await downloader.localizeImages(lessonData.contentHtml || '', lessonDir);
 
                             let hasVideo = false;
+                            let videoError: string | undefined;
                             if (lessonData.videoLink) {
                                 try {
                                     updateStatus('Downloading video...');
                                     await downloader.downloadVideo(lessonData.videoLink, lessonDir, 'video');
                                     hasVideo = true;
                                 } catch (err) {
-                                    logger.warn(`    ⚠️ Failed to download video for ${lesson.title}`);
+                                    videoError = summarizeVideoError(err);
+                                    failures.push({
+                                        lessonTitle: taskTitle,
+                                        lessonUrl: lesson.url,
+                                        lessonDir,
+                                        kind: 'video',
+                                        reason: videoError,
+                                        videoUrl: lessonData.videoLink
+                                    });
+                                    taskError = new Error(`Video failed: ${videoError}`);
+                                    logger.warn(`    ⚠️ Failed to download video for ${lesson.title}: ${videoError}`);
                                 }
                             }
 
@@ -467,12 +534,25 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                 results.forEach(r => { if (r) resourcesHtml.push(r); });
                             }
 
+                            updateStatus('Saving community posts...');
+                            const linkedPostViews = await Promise.all((lessonData.linkedPosts ?? []).map(async (post) => ({
+                                ...post,
+                                contentHtml: await downloader.localizeImages(post.contentHtml, lessonDir),
+                                files: await saveLinkedPostFiles(post, lessonDir, downloader, logger)
+                            })));
+                            const linkedPostsHtml = renderLinkedPosts(linkedPostViews);
+
                             const isRootLesson = mInfo.moduleDirName.length === 0;
                             const groupLink = isRootLesson ? '../../index.html' : '../../../index.html';
                             const courseLink = isRootLesson ? '../index.html' : '../../index.html';
                             const moduleBreadcrumb = isRootLesson
                                 ? ''
                                 : `<span>/</span><span>${module.title}</span>`;
+                            const courseDirName = path.basename(baseOutputDir);
+                            const lessonRelativePath = (mInfo.moduleDirName
+                                ? `${mInfo.moduleDirName}/${lessonDirName}/index.html`
+                                : `${lessonDirName}/index.html`).replace(/\\/g, '/');
+                            const lessonId = `${courseDirName}/${lessonRelativePath}`;
 
                             const htmlContent = `
                             <!DOCTYPE html>
@@ -522,6 +602,80 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                             0 10px 20px rgba(15, 23, 42, 0.08);
                                     }
                                     h1 { margin: 0 0 16px 0; font-size: clamp(1.8rem, 3vw, 2.6rem); }
+                                    .lesson-title-tick {
+                                        display: inline-flex;
+                                        align-items: center;
+                                        justify-content: center;
+                                        width: 34px;
+                                        height: 34px;
+                                        border-radius: 50%;
+                                        background: #ffffff;
+                                        border: 2.5px solid #cbd5e1;
+                                        color: #94a3b8;
+                                        margin-left: 14px;
+                                        vertical-align: middle;
+                                        cursor: pointer;
+                                        transition: all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                                        padding: 0;
+                                        position: relative;
+                                        top: -3px;
+                                        flex-shrink: 0;
+                                        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.06);
+                                    }
+                                    .lesson-title-tick svg { width: 18px; height: 18px; }
+                                    .lesson-title-tick:hover { border-color: #94a3b8; color: #64748b; transform: scale(1.12); }
+                                    .lesson-title-tick.is-completed {
+                                        background: #10b981;
+                                        border-color: #10b981;
+                                        color: #ffffff;
+                                        box-shadow: 0 3px 12px rgba(16, 185, 129, 0.45);
+                                        animation: tickPop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                                    }
+                                    @keyframes tickPop {
+                                        0% { transform: scale(0.8); }
+                                        50% { transform: scale(1.18); }
+                                        100% { transform: scale(1); }
+                                    }
+                                    .sync-pill {
+                                        position: fixed;
+                                        bottom: 18px;
+                                        right: 18px;
+                                        z-index: 99999;
+                                        display: inline-flex;
+                                        align-items: center;
+                                        gap: 8px;
+                                        padding: 7px 14px;
+                                        background: #0f172a;
+                                        color: #f8fafc;
+                                        font-size: 0.8rem;
+                                        font-weight: 500;
+                                        border-radius: 9999px;
+                                        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+                                        border: 1px solid rgba(255, 255, 255, 0.14);
+                                        font-family: inherit;
+                                        transition: all 0.25s ease;
+                                        user-select: none;
+                                    }
+                                    .sync-pill .sync-dot {
+                                        width: 8px;
+                                        height: 8px;
+                                        border-radius: 50%;
+                                        background: #f59e0b;
+                                        flex-shrink: 0;
+                                        transition: background 0.2s ease, box-shadow 0.2s ease;
+                                    }
+                                    .sync-pill.is-connected .sync-dot {
+                                        background: #10b981;
+                                        box-shadow: 0 0 8px #10b981;
+                                    }
+                                    .sync-pill a {
+                                        color: #38bdf8;
+                                        text-decoration: none;
+                                        font-weight: 600;
+                                    }
+                                    .sync-pill a:hover {
+                                        text-decoration: underline;
+                                    }
                                     video {
                                         width: 100%;
                                         border-radius: 14px;
@@ -533,6 +687,67 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                     img { max-width: 100%; border-radius: 10px; height: auto; margin: 14px 0; }
                                     .content { font-size: 1.05rem; }
                                     .content p { margin-bottom: 1.2em; }
+                                    .content pre {
+                                        background: #1e1e24;
+                                        color: #f8f9fa;
+                                        border: 1px solid rgba(20,22,29,0.1);
+                                        border-radius: 10px;
+                                        padding: 16px 20px;
+                                        overflow-x: auto;
+                                        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+                                        font-size: 0.95rem;
+                                        line-height: 1.6;
+                                        margin: 18px 0;
+                                    }
+                                    .content pre code {
+                                        background: transparent;
+                                        color: inherit;
+                                        padding: 0;
+                                        border-radius: 0;
+                                        font-size: inherit;
+                                    }
+                                    .content code {
+                                        background: rgba(20,22,29,0.06);
+                                        color: #d63384;
+                                        padding: 2px 6px;
+                                        border-radius: 5px;
+                                        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+                                        font-size: 0.9em;
+                                    }
+                                    .content blockquote {
+                                        margin: 18px 0;
+                                        padding: 12px 20px;
+                                        border-left: 4px solid var(--accent);
+                                        background: var(--panel-2);
+                                        border-radius: 0 10px 10px 0;
+                                        color: var(--text);
+                                    }
+                                    .content hr {
+                                        border: none;
+                                        border-top: 1px solid rgba(20,22,29,0.1);
+                                        margin: 28px 0;
+                                    }
+                                    .content ul, .content ol {
+                                        margin: 14px 0 18px 24px;
+                                        padding: 0;
+                                    }
+                                    .content li {
+                                        margin-bottom: 8px;
+                                    }
+                                    .content table {
+                                        width: 100%;
+                                        border-collapse: collapse;
+                                        margin: 20px 0;
+                                    }
+                                    .content th, .content td {
+                                        border: 1px solid rgba(20,22,29,0.1);
+                                        padding: 10px 14px;
+                                        text-align: left;
+                                    }
+                                    .content th {
+                                        background: var(--panel-2);
+                                        font-weight: 600;
+                                    }
                                     .resources {
                                         background: var(--panel-2);
                                         padding: 18px;
@@ -551,6 +766,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                         text-decoration: none;
                                     }
                                     .resources a::before { content: "📁"; }
+                                    ${LINKED_POSTS_CSS}
                                     a { color: var(--accent); text-decoration: none; word-break: break-word; }
                                     a:hover { text-decoration: underline; }
                                     .nav { margin-top: 28px; padding-top: 16px; border-top: 1px solid rgba(20,22,29,0.08); }
@@ -567,7 +783,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                         <span>${lessonData.title}</span>
                                     </div>
                                     <div class="container">
-                                        <h1>${lessonData.title}</h1>
+                                        <h1>${lessonData.title} <button type="button" class="lesson-title-tick" id="lessonTickBtn" data-lesson-id="${lessonId}" title="Marcar como realizada" aria-label="Marcar como realizada"><svg viewBox="0 0 20 20" fill="none"><path d="M4.5 10.5L8 14L15.5 5.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button></h1>
                                         ${hasVideo ? '<video controls src="video.mp4"></video>' : ''}
                                         <div class="content">
                                             ${localizedHtml}
@@ -580,11 +796,13 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                             </ul>
                                         </div>
                                         ` : ''}
+                                        ${linkedPostsHtml}
                                         <div class="nav">
                                             <a href="${courseLink}">Back to Course Index</a>
                                         </div>
                                     </div>
                                 </div>
+                                ${renderLessonProgressScript()}
                             </body>
                             </html>
                         `;
@@ -604,6 +822,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                     ? `${mInfo.moduleDirName}/${lessonDirName}/index.html`
                                     : `${lessonDirName}/index.html`,
                                 hasVideo,
+                                videoError,
                                 resourcesCount: resourcesHtml.length,
                                 updatedAt: new Date().toISOString()
                             };
@@ -620,9 +839,17 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             });
 
                             updateStatus('Updating course index...');
-                            indexLimit(() => regenerateIndex(baseOutputDir, { silent: options.suppressIndexLogs }));
+                            indexLimit(() => regenerateIndex(baseOutputDir, { silent: options.suppressIndexLogs, patchLessons: false }));
                         } catch (err) {
                             failedLessons += 1;
+                            failures.push({
+                                lessonTitle: taskTitle,
+                                lessonUrl: lesson.url,
+                                lessonDir,
+                                kind: 'lesson',
+                                reason: String(err)
+                            });
+                            taskError = err instanceof Error ? err : new Error(String(err));
                             options.callbacks?.onLessonError?.({
                                 moduleIndex: mInfo.mIndex,
                                 lessonIndex: lIndex,
@@ -631,6 +858,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             });
                             logger.error(`    ⚠️ Error processing lesson ${lesson.title}: ${String(err)}`);
                         }
+                        if (taskError) throw taskError;
                     }
                 });
             }
@@ -652,12 +880,27 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
             lessonsCount: totalLessons,
             completedLessons,
             failedLessons,
+            failedVideos: failures.filter(f => f.kind === 'video').length,
+            failures,
             targetLessonId
         };
 
+        // Kept next to the course so a rerun (which retries exactly these) and
+        // the person reading the output both know what is missing.
+        const failuresPath = path.join(baseOutputDir, '.download-failures.json');
+        if (failures.length > 0) {
+            await writeAtomicJson(failuresPath, { updatedAt: new Date().toISOString(), failures });
+        } else if (!targetLessonId) {
+            await fs.remove(failuresPath);
+        }
+
         options.callbacks?.onCourseComplete?.(summary);
 
-        logger.info('\n✨ All downloads complete!');
+        if (failures.length > 0) {
+            logger.warn(`\n⚠️ ${courseName}: ${summary.failedLessons} lessons and ${summary.failedVideos} videos failed (see .download-failures.json). Rerun to retry them.`);
+        } else {
+            logger.info('\n✨ All downloads complete!');
+        }
         logger.info(`Check your files in: ${baseOutputDir}`);
 
         return summary;
