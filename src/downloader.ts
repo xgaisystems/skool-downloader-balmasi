@@ -378,23 +378,35 @@ function findFfmpegOnPath(): string | null {
  * it has no build for. A failure there must not break the whole install, so
  * fall back to a system ffmpeg before giving up.
  */
-async function resolveFfmpegPath(): Promise<string> {
+async function resolveFfmpegPaths(): Promise<string[]> {
+    const candidates: string[] = [];
+
+    // SKOOL_FFMPEG_PATH wins so a user can point at a newer build when the
+    // bundled one breaks on some host's streams.
+    const override = process.env.SKOOL_FFMPEG_PATH;
+    if (override && fs.existsSync(override)) candidates.push(override);
+
     try {
         // Imported dynamically. A static import of a missing optional
         // dependency throws while the module loads and takes down the whole CLI.
         const mod: any = await import('ffmpeg-static');
         const bundled = mod.default || mod;
         if (typeof bundled === 'string' && fs.existsSync(bundled)) {
-            return bundled;
+            candidates.push(bundled);
         }
     } catch {
         // Not installed. The system PATH is the next place to look.
     }
 
+    // Kept even when the bundled copy exists: ffmpeg-static 5.3.0 (ffmpeg
+    // 7.0.2) segfaults in its MPEG-TS demuxer on some Loom HLS streams, and a
+    // system build is the first thing to retry the merge with.
     const systemFfmpeg = findFfmpegOnPath();
-    if (systemFfmpeg) return systemFfmpeg;
+    if (systemFfmpeg) candidates.push(systemFfmpeg);
 
-    throw new Error(FFMPEG_INSTALL_HINT);
+    const unique = [...new Set(candidates)];
+    if (unique.length === 0) throw new Error(FFMPEG_INSTALL_HINT);
+    return unique;
 }
 
 const STALE_EXTRACTOR_HINT = [
@@ -419,9 +431,47 @@ function looksLikeStaleExtractor(error: unknown): boolean {
     );
 }
 
+/**
+ * yt-dlp reports a crashed merge as "ERROR: Postprocessing: <last line of
+ * ffmpeg stderr>", which for a segfault is just a progress line.
+ */
+function isPostprocessingFailure(error: unknown): boolean {
+    return /ERROR: Postprocessing|ffmpeg exited|Conversion failed/i.test(String(error));
+}
+
+/**
+ * The yt-dlp error message embeds the whole command line and stderr. Keep the
+ * ERROR lines, which are what a person can act on.
+ */
+export function summarizeVideoError(error: unknown): string {
+    const lines = String(error).split('\n').map(l => l.trim());
+    const errors = [...new Set(lines.filter(l => l.startsWith('ERROR:')))];
+    const summary = errors.length > 0 ? errors.join(' | ') : (lines.find(Boolean) || 'unknown error');
+    return summary.length > 300 ? `${summary.slice(0, 297)}...` : summary;
+}
+
+/**
+ * A failed yt-dlp run leaves the separate streams, .part fragments and the
+ * half-merged .temp.mp4 next to where the video should be. They are never
+ * reused once the format changes, so clear them before a retry and after
+ * giving up.
+ */
+async function removeVideoLeftovers(outputDir: string, filename: string) {
+    const finalName = `${filename}.mp4`;
+    let entries: string[] = [];
+    try {
+        entries = await fs.readdir(outputDir);
+    } catch {
+        return;
+    }
+    await Promise.all(entries
+        .filter(name => name.startsWith(`${filename}.`) && name !== finalName)
+        .map(name => fs.remove(path.join(outputDir, name)).catch(() => {})));
+}
+
 export class Downloader {
     private ytDlp: any = null;
-    private ffmpegPath: string | null = null;
+    private ffmpegPaths: string[] = [];
     private initPromise: Promise<void> | null = null;
     private logger: Logger;
 
@@ -438,7 +488,7 @@ export class Downloader {
             // re-awaits this rejected promise instead of finding ytDlp set,
             // skipping init, and quietly downloading unmerged streams. It also
             // reports the problem before the 36 MB yt-dlp download, not after.
-            this.ffmpegPath = await resolveFfmpegPath();
+            this.ffmpegPaths = await resolveFfmpegPaths();
 
             await fs.ensureDir(BIN_DIR);
 
@@ -478,7 +528,7 @@ export class Downloader {
         const displayUrl = url.length > 100 ? url.substring(0, 97) + '...' : url;
         this.logger.info(`    ⬇️  Downloading video from ${displayUrl}`);
 
-        const args = [
+        const baseArgs = [
             url,
             '-o', outputPath,
             '--no-check-certificates',
@@ -490,26 +540,45 @@ export class Downloader {
             '--postprocessor-args', 'ffmpeg:-movflags +faststart'
         ];
 
-        // Without this yt-dlp cannot merge the separate video and audio streams
-        // and leaves both files behind instead of one playable mp4.
-        if (this.ffmpegPath) {
-            args.push('--ffmpeg-location', this.ffmpegPath);
-        }
-
         if (fs.existsSync(COOKIES_TXT_PATH)) {
-            args.push('--cookies', COOKIES_TXT_PATH);
+            baseArgs.push('--cookies', COOKIES_TXT_PATH);
         }
 
-        try {
-            await this.ytDlp!.execPromise(args);
-            this.logger.info(`Video downloaded successfully to ${outputDir}`);
-        } catch (error) {
-            this.logger.error(`Error downloading video: ${String(error)}`);
-            if (looksLikeStaleExtractor(error)) {
-                this.logger.error(STALE_EXTRACTOR_HINT);
+        // Without --ffmpeg-location yt-dlp cannot merge the separate video and
+        // audio streams and leaves both files behind instead of one playable
+        // mp4. When the merge itself crashes, retry with every other ffmpeg we
+        // know of, and finally with `-f b`: the best single file that already
+        // carries both streams (Loom's http-transcoded mp4), so nothing has to
+        // be merged at all.
+        const attempts: Array<{ label: string; args: string[] }> = this.ffmpegPaths.map(ffmpeg => ({
+            label: `ffmpeg ${ffmpeg}`,
+            args: [...baseArgs, '--ffmpeg-location', ffmpeg]
+        }));
+        attempts.push({
+            label: 'single-file format (no merge)',
+            args: [...baseArgs, '-f', 'b', '--ffmpeg-location', this.ffmpegPaths[0]!]
+        });
+
+        let lastError: unknown = null;
+        for (const [i, attempt] of attempts.entries()) {
+            try {
+                if (i > 0) this.logger.info(`    🔁 Retrying video with ${attempt.label}`);
+                await this.ytDlp!.execPromise(attempt.args);
+                this.logger.info(`Video downloaded successfully to ${outputDir}`);
+                return;
+            } catch (error) {
+                lastError = error;
+                await removeVideoLeftovers(outputDir, filename);
+                if (!isPostprocessingFailure(error)) break;
+                this.logger.warn(`    ⚠️ Video merge failed with ${attempt.label}: ${summarizeVideoError(error)}`);
             }
-            throw error;
         }
+
+        this.logger.error(`Error downloading video ${displayUrl}: ${summarizeVideoError(lastError)}`);
+        if (looksLikeStaleExtractor(lastError)) {
+            this.logger.error(STALE_EXTRACTOR_HINT);
+        }
+        throw lastError;
     }
 
     async downloadAsset(url: string, outputPath: string) {
@@ -523,25 +592,34 @@ export class Downloader {
             }
         }
 
-        const writer = fs.createWriteStream(outputPath);
+        // Written next to the target and renamed at the end. A partial file at
+        // outputPath has a non-zero size, so the check above would have
+        // skipped it on every later run.
+        const tempPath = `${outputPath}.part`;
+        try {
+            const response = await axios({
+                url,
+                method: 'GET',
+                responseType: 'stream',
+                headers: {
+                    'Referer': 'https://www.skool.com/',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                },
+                // In Node this is an idle timeout on the socket, so it also
+                // aborts a body that stops arriving halfway.
+                timeout: 10000
+            });
 
-        const response = await axios({
-            url,
-            method: 'GET',
-            responseType: 'stream',
-            headers: {
-                'Referer': 'https://www.skool.com/',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            },
-            timeout: 10000
-        });
-
-        (response.data as Readable).pipe(writer);
-
-        return new Promise((resolve, reject) => {
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-        });
+            // pipeline() rather than pipe(): pipe() does not forward an error
+            // from the response to the file, so a dropped connection left the
+            // promise pending forever and hung the lesson and every course
+            // queued after it.
+            await pipeline(response.data as Readable, fs.createWriteStream(tempPath));
+            await fs.move(tempPath, outputPath, { overwrite: true });
+        } catch (err) {
+            await fs.remove(tempPath).catch(() => {});
+            throw err;
+        }
     }
 
     async localizeImages(html: string, outputDir: string): Promise<string> {

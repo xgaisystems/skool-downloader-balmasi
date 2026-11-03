@@ -12,7 +12,8 @@
     "prepare": "husky || true",
     "skool": "tsx src/cli.ts",
     "login": "tsx src/cli.ts login",
-    "regenerate-index": "tsx src/cli.ts regenerate-index"
+    "regenerate-index": "tsx src/cli.ts regenerate-index",
+    "serve": "tsx src/cli.ts serve"
   },
   "author": "balmasi",
   "license": "CC-BY-NC-4.0",
@@ -34,11 +35,16 @@
   "dependencies": {
     "@clack/prompts": "^0.11.0",
     "axios": "^1.13.3",
+    "cli-cursor": "^5.0.0",
+    "cli-truncate": "^6.1.1",
     "fs-extra": "^11.3.3",
     "listr2": "^10.1.0",
+    "log-update": "^8.0.0",
+    "marked": "^18.1.2",
     "p-limit": "^7.2.0",
     "picocolors": "^1.1.1",
     "playwright": "^1.62.1",
+    "string-width": "^8.3.0",
     "yt-dlp-wrap": "^2.3.12"
   },
   "devDependencies": {
@@ -52,5 +58,8 @@
   },
   "optionalDependencies": {
     "ffmpeg-static": "^5.3.0"
+  },
+  "allowScripts": {
+    "ffmpeg-static@5.3.0": true
   }
 }

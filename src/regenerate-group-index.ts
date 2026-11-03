@@ -1,5 +1,7 @@
 import fs from 'fs-extra';
 import path from 'path';
+import { formatDate } from './utils.js';
+import { renderProgressScript } from './progress-sync.js';
 
 type CourseManifest = {
     courseName: string;
@@ -21,6 +23,7 @@ type GroupIndexCourse = {
     courseImagePath?: string;
     modulesCount: number;
     lessonsCount: number;
+    lessonIds: string[];
     updatedAt?: string;
 };
 
@@ -34,9 +37,9 @@ async function writeAtomicHtml(filePath: string, content: string) {
     await fs.move(tempPath, filePath, { overwrite: true });
 }
 
-async function countLessons(coursePath: string) {
+async function countLessons(coursePath: string, dirName: string) {
     let modulesCount = 0;
-    let lessonsCount = 0;
+    const lessonIds: string[] = [];
 
     const moduleEntries = await fs.readdir(coursePath, { withFileTypes: true });
     const moduleDirs: typeof moduleEntries = [];
@@ -67,7 +70,14 @@ async function countLessons(coursePath: string) {
             const manifestPath = path.join(lessonPath, 'lesson.json');
 
             if (await fs.pathExists(indexPath) || await fs.pathExists(manifestPath)) {
-                lessonsCount += 1;
+                let relativePath = `${moduleDir.name}/${lessonDir.name}/index.html`;
+                if (await fs.pathExists(manifestPath)) {
+                    try {
+                        const manifest = await fs.readJson(manifestPath);
+                        if (manifest.relativePath) relativePath = manifest.relativePath;
+                    } catch {}
+                }
+                lessonIds.push(`${dirName}/${relativePath.replace(/\\/g, '/')}`);
             }
         }
     }
@@ -77,11 +87,18 @@ async function countLessons(coursePath: string) {
         const indexPath = path.join(lessonPath, 'index.html');
         const manifestPath = path.join(lessonPath, 'lesson.json');
         if (await fs.pathExists(indexPath) || await fs.pathExists(manifestPath)) {
-            lessonsCount += 1;
+            let relativePath = `${lessonDir.name}/index.html`;
+            if (await fs.pathExists(manifestPath)) {
+                try {
+                    const manifest = await fs.readJson(manifestPath);
+                    if (manifest.relativePath) relativePath = manifest.relativePath;
+                } catch {}
+            }
+            lessonIds.push(`${dirName}/${relativePath.replace(/\\/g, '/')}`);
         }
     }
 
-    return { modulesCount, lessonsCount };
+    return { modulesCount, lessonsCount: lessonIds.length, lessonIds };
 }
 
 async function loadCourseInfo(coursePath: string, dirName: string): Promise<GroupIndexCourse | null> {
@@ -97,8 +114,16 @@ async function loadCourseInfo(coursePath: string, dirName: string): Promise<Grou
 
     const courseName = manifest?.courseName || dirName;
     const groupName = manifest?.groupName;
-    const courseImagePath = manifest?.courseImagePath;
-    const counts = await countLessons(coursePath);
+    let courseImagePath = manifest?.courseImagePath;
+    if (!courseImagePath) {
+        for (const ext of [".jpg", ".jpeg", ".png", ".webp"]) {
+            if (await fs.pathExists(path.join(coursePath, `assets/course-cover${ext}`))) {
+                courseImagePath = `assets/course-cover${ext}`;
+                break;
+            }
+        }
+    }
+    const counts = await countLessons(coursePath, dirName);
 
     return {
         dirName,
@@ -107,6 +132,7 @@ async function loadCourseInfo(coursePath: string, dirName: string): Promise<Grou
         courseImagePath,
         modulesCount: counts.modulesCount,
         lessonsCount: counts.lessonsCount,
+        lessonIds: counts.lessonIds,
         updatedAt: manifest?.updatedAt
     };
 }
@@ -155,6 +181,10 @@ async function regenerateGroupIndex(
     });
 
     const totalLessons = courses.reduce((acc, course) => acc + course.lessonsCount, 0);
+    const courseLessonsMap: Record<string, string[]> = {};
+    courses.forEach(c => {
+        courseLessonsMap[c.dirName] = c.lessonIds;
+    });
 
     const courseCards = await Promise.all(
         courses.map(async (course) => {
@@ -171,24 +201,39 @@ async function regenerateGroupIndex(
             }
 
             const updatedLabel = course.updatedAt
-                ? new Date(course.updatedAt).toLocaleDateString()
+                ? formatDate(course.updatedAt)
                 : 'Unknown';
 
             return `
-                <a class="course-card" href="${courseIndexPath}">
+                <a class="course-card" href="${courseIndexPath}" data-course-dir="${course.dirName}">
                     <div class="course-image">${imageMarkup}</div>
                     <div class="course-body">
-                        <h2>${course.courseName}</h2>
+                        <div class="course-card-header">
+                            <h2>${course.courseName}</h2>
+                            <span class="course-tick" data-course-dir="${course.dirName}" role="button" title="Marcar curso completo" aria-label="Marcar curso completo">
+                                <svg viewBox="0 0 20 20" fill="none"><path d="M4.5 10.5L8 14L15.5 5.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            </span>
+                        </div>
                         <p class="course-meta">Updated ${updatedLabel}</p>
                         <div class="course-stats">
                             <span><strong>${course.modulesCount}</strong> modules</span>
                             <span><strong>${course.lessonsCount}</strong> lessons</span>
+                            <span class="course-progress-badge"><strong>0</strong> / ${course.lessonsCount} completadas</span>
                         </div>
                     </div>
                 </a>
             `;
         })
     );
+
+        const coverCandidates = ["portada.png", "portada.jpg", "cover.png", "cover.jpg"];
+    let groupCoverImage: string | null = null;
+    for (const cand of coverCandidates) {
+        if (fs.existsSync(path.join(groupDir, cand))) {
+            groupCoverImage = cand;
+            break;
+        }
+    }
 
     const indexHtml = `
         <!DOCTYPE html>
@@ -223,12 +268,19 @@ async function regenerateGroupIndex(
                     padding: 0 24px;
                 }
                 .hero {
+                    ${groupCoverImage ? "display: grid; grid-template-columns: 1fr; gap: 28px; align-items: center;" : ""}
                     background: linear-gradient(180deg, rgba(255,255,255,0.97) 0%, rgba(255,255,255,0.92) 100%);
                     border-radius: 26px;
                     padding: 32px;
                     box-shadow:
                         0 25px 45px rgba(15, 23, 42, 0.18),
                         0 10px 20px rgba(15, 23, 42, 0.08);
+                }
+                .hero-copy {
+                    display: flex;
+                    flex-direction: column;
+                    justify-content: center;
+                    gap: 6px;
                 }
                 .hero-title {
                     font-size: clamp(2.3rem, 4vw, 3.2rem);
@@ -244,6 +296,27 @@ async function regenerateGroupIndex(
                     display: flex;
                     flex-wrap: wrap;
                     gap: 12px;
+                }
+                .hero-image {
+                    position: relative;
+                    border-radius: 18px;
+                    overflow: hidden;
+                    background: #020617;
+                    border: 1px solid var(--ring);
+                    box-shadow: 0 16px 28px rgba(15, 23, 42, 0.14);
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    align-self: center;
+                    width: 100%;
+                    max-height: 320px;
+                }
+                .hero-image img {
+                    width: 100%;
+                    height: auto;
+                    max-height: 320px;
+                    object-fit: contain;
+                    display: block;
                 }
                 .chip {
                     padding: 10px 14px;
@@ -282,14 +355,17 @@ async function regenerateGroupIndex(
                 .course-image {
                     aspect-ratio: 16 / 9;
                     min-height: 0;
-                    background: #f0f2f7;
+                    background: #020617;
                     border-bottom: 1px solid var(--ring);
                     overflow: hidden;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
                 }
                 .course-image img {
                     width: 100%;
                     height: 100%;
-                    object-fit: cover;
+                    object-fit: contain;
                     display: block;
                 }
                 .course-fallback {
@@ -305,9 +381,54 @@ async function regenerateGroupIndex(
                     flex-direction: column;
                     gap: 10px;
                 }
-                .course-body h2 {
+                .course-card-header {
+                    display: flex;
+                    align-items: flex-start;
+                    justify-content: space-between;
+                    gap: 12px;
+                }
+                .course-card-header h2 {
                     margin: 0;
                     font-size: 1.2rem;
+                    flex: 1;
+                }
+                .course-tick {
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    width: 24px;
+                    height: 24px;
+                    min-width: 24px;
+                    border-radius: 50%;
+                    background: #ffffff;
+                    border: 2px solid #cbd5e1;
+                    color: #94a3b8;
+                    cursor: pointer;
+                    transition: all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                    padding: 0;
+                    flex-shrink: 0;
+                    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+                }
+                .course-tick svg {
+                    width: 14px;
+                    height: 14px;
+                }
+                .course-tick:hover {
+                    border-color: #94a3b8;
+                    color: #64748b;
+                    transform: scale(1.15);
+                }
+                .course-tick.is-completed {
+                    background: #10b981;
+                    border-color: #10b981;
+                    color: #ffffff;
+                    box-shadow: 0 2px 8px rgba(16, 185, 129, 0.4);
+                    animation: tickPop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                }
+                @keyframes tickPop {
+                    0% { transform: scale(0.8); }
+                    50% { transform: scale(1.18); }
+                    100% { transform: scale(1); }
                 }
                 .course-meta {
                     margin: 0;
@@ -321,23 +442,122 @@ async function regenerateGroupIndex(
                     font-size: 0.95rem;
                 }
                 .course-stats strong { color: var(--accent-2); }
+                .course-progress-badge {
+                    color: var(--muted);
+                }
+                .course-progress-badge strong {
+                    color: var(--accent);
+                }
+                .sync-pill {
+                    position: fixed;
+                    bottom: 18px;
+                    right: 18px;
+                    z-index: 99999;
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 8px;
+                    padding: 7px 14px;
+                    background: #0f172a;
+                    color: #f8fafc;
+                    font-size: 0.8rem;
+                    font-weight: 500;
+                    border-radius: 9999px;
+                    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+                    border: 1px solid rgba(255, 255, 255, 0.14);
+                    font-family: inherit;
+                    transition: all 0.25s ease;
+                    user-select: none;
+                }
+                .sync-pill .sync-dot {
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 50%;
+                    background: #f59e0b;
+                    flex-shrink: 0;
+                    transition: background 0.2s ease, box-shadow 0.2s ease;
+                }
+                .sync-pill.is-connected .sync-dot {
+                    background: #10b981;
+                    box-shadow: 0 0 8px #10b981;
+                }
+                .sync-pill a {
+                    color: #38bdf8;
+                    text-decoration: none;
+                    font-weight: 600;
+                }
+                .sync-pill a:hover {
+                    text-decoration: underline;
+                }
+                ${groupCoverImage ? "@media (min-width: 900px) { .hero { grid-template-columns: 1.15fr 0.85fr; } }" : ""}
             </style>
         </head>
         <body>
             <div class="page">
                 <section class="hero">
-                    <h1 class="hero-title">${groupName}</h1>
-                    <p class="hero-subtitle">All downloaded courses for this community.</p>
-                    <div class="hero-meta">
-                        <div class="chip"><strong>${courses.length}</strong> courses</div>
-                        <div class="chip"><strong>${totalLessons}</strong> lessons</div>
-                        <div class="chip">Updated: <strong>${new Date().toLocaleDateString()}</strong></div>
+                    <div class="hero-copy">
+                        <h1 class="hero-title">${groupName}</h1>
+                        <p class="hero-subtitle">All downloaded courses for this community.</p>
+                        <div class="hero-meta">
+                            <div class="chip" id="globalProgressChip">Progreso: <strong>0 / ${totalLessons}</strong> completadas</div>
+                            <div class="chip"><strong>${courses.length}</strong> courses</div>
+                            <div class="chip"><strong>${totalLessons}</strong> lessons</div>
+                            <div class="chip">Updated: <strong>${formatDate()}</strong></div>
+                        </div>
                     </div>
+                    ${groupCoverImage ? `
+                    <div class="hero-image">
+                        <img src="${groupCoverImage}" alt="${groupName} portada">
+                    </div>` : ""}
                 </section>
                 <section class="courses">
                     ${courseCards.join('')}
                 </section>
             </div>
+            ${renderProgressScript(`
+    const COURSE_LESSONS = ${JSON.stringify(courseLessonsMap).replace(/</g, '\\u003c')};
+    const TOTAL_LESSONS = ${totalLessons};
+
+    function render(data) {
+        let globalCount = 0;
+        document.querySelectorAll('.course-card').forEach(card => {
+            const lessonIds = COURSE_LESSONS[card.getAttribute('data-course-dir')] || [];
+            const courseCount = lessonIds.filter(id => data[id]).length;
+            globalCount += courseCount;
+
+            const badge = card.querySelector('.course-progress-badge');
+            if (badge) badge.innerHTML = '<strong>' + courseCount + '</strong> / ' + lessonIds.length + ' completadas';
+
+            const tick = card.querySelector('.course-tick');
+            if (tick) {
+                const isAllDone = lessonIds.length > 0 && courseCount === lessonIds.length;
+                tick.classList.toggle('is-completed', isAllDone);
+                tick.setAttribute('aria-pressed', isAllDone ? 'true' : 'false');
+                tick.setAttribute('title', isAllDone ? 'Marcar curso como incompleto' : 'Marcar curso completo');
+            }
+        });
+
+        const globalChip = document.getElementById('globalProgressChip');
+        if (globalChip) globalChip.innerHTML = 'Progreso: <strong>' + globalCount + ' / ' + TOTAL_LESSONS + '</strong> completadas';
+    }
+
+    document.addEventListener('click', (e) => {
+        const tick = e.target.closest('.course-tick');
+        if (!tick) return;
+        e.preventDefault();
+        e.stopPropagation();
+
+        const lessonIds = COURSE_LESSONS[tick.getAttribute('data-course-dir')] || [];
+        if (!lessonIds.length) return;
+
+        const data = getCompleted();
+        const allDone = lessonIds.every(id => !!data[id]);
+        lessonIds.forEach(id => { if (allDone) delete data[id]; else data[id] = true; });
+        saveCompleted(data, true);
+        render(data);
+    });
+
+    startProgressSync(render);
+`)}
         </body>
         </html>
     `;
