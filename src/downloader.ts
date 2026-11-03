@@ -7,8 +7,13 @@ import https from 'https';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import type { IncomingMessage } from 'http';
+import { execFile } from 'child_process';
+import { createRequire } from 'module';
+import { promisify } from 'util';
 import { createConsoleLogger, type Logger } from './logger.js';
 import { COOKIES_TXT_PATH } from './auth.js';
+
+const execFileAsync = promisify(execFile);
 
 const YTDlpWrap = (YTDlpWrapPkg as any).default || YTDlpWrapPkg;
 
@@ -342,9 +347,9 @@ export function getYtDlpPaths() {
     return { binDir: BIN_DIR, binaryPath: YTDLP_PATH, previousPath: PREVIOUS_YTDLP_PATH };
 }
 
-const FFMPEG_INSTALL_HINT = [
+export const FFMPEG_INSTALL_HINT = [
     'ffmpeg is required to merge video and audio into a single file, but none was found.',
-    'The bundled copy could not be installed, so please install ffmpeg manually:',
+    'Install it yourself (a system ffmpeg is also newer than the bundled one):',
     '  macOS:   brew install ffmpeg',
     '  Windows: winget install Gyan.FFmpeg',
     '  Linux:   sudo apt install ffmpeg'
@@ -378,35 +383,131 @@ function findFfmpegOnPath(): string | null {
  * it has no build for. A failure there must not break the whole install, so
  * fall back to a system ffmpeg before giving up.
  */
-async function resolveFfmpegPaths(): Promise<string[]> {
-    const candidates: string[] = [];
+export type FfmpegCandidate = {
+    path: string;
+    source: 'SKOOL_FFMPEG_PATH' | 'bundled' | 'system';
+    // Whatever `ffmpeg -version` reports, e.g. "7.0.2-static" or
+    // "8.0.1-3ubuntu2"; null when it prints something we cannot read.
+    version: string | null;
+};
 
-    // SKOOL_FFMPEG_PATH wins so a user can point at a newer build when the
-    // bundled one breaks on some host's streams.
-    const override = process.env.SKOOL_FFMPEG_PATH;
-    if (override && fs.existsSync(override)) candidates.push(override);
+/**
+ * Runs `ffmpeg -version`. Returns undefined when the binary cannot run at
+ * all (wrong architecture, truncated download, missing libraries), so it is
+ * never handed to yt-dlp.
+ */
+async function probeFfmpegVersion(bin: string): Promise<string | null | undefined> {
+    try {
+        const { stdout } = await execFileAsync(bin, ['-version'], { timeout: 10_000 });
+        return /ffmpeg version (\S+)/.exec(stdout)?.[1] ?? null;
+    } catch {
+        return undefined;
+    }
+}
 
+// "7.0.2-static" -> [7, 0, 2], "n9.0.1-11-g..." -> [9, 0, 1]. Nightly builds
+// ("N-118000-g...") carry no release number and sort after the ones that do.
+function parseFfmpegVersion(version: string | null): number[] | null {
+    const match = version ? /^n?(\d+)\.(\d+)(?:\.(\d+))?/.exec(version) : null;
+    return match ? [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)] : null;
+}
+
+function compareVersionsDesc(a: number[] | null, b: number[] | null): number {
+    if (!a || !b) return (a ? 0 : 1) - (b ? 0 : 1);
+    for (let i = 0; i < 3; i++) {
+        if (a[i] !== b[i]) return b[i]! - a[i]!;
+    }
+    return 0;
+}
+
+async function findBundledFfmpeg(): Promise<string | null> {
     try {
         // Imported dynamically. A static import of a missing optional
         // dependency throws while the module loads and takes down the whole CLI.
         const mod: any = await import('ffmpeg-static');
         const bundled = mod.default || mod;
-        if (typeof bundled === 'string' && fs.existsSync(bundled)) {
-            candidates.push(bundled);
-        }
+        return typeof bundled === 'string' ? bundled : null;
     } catch {
-        // Not installed. The system PATH is the next place to look.
+        return null;
+    }
+}
+
+/**
+ * Every ffmpeg that runs, best first. SKOOL_FFMPEG_PATH always leads because
+ * it is an explicit choice. The rest are ordered by version, newest first:
+ * the bundled ffmpeg-static 5.3.0 is ffmpeg 7.0.2, which segfaults in its
+ * MPEG-TS demuxer on some Loom HLS streams, so a newer system build should do
+ * the merge and the bundled copy only backs it up.
+ */
+export async function findFfmpegCandidates(): Promise<FfmpegCandidate[]> {
+    const found: Array<Omit<FfmpegCandidate, 'version'>> = [];
+
+    const override = process.env.SKOOL_FFMPEG_PATH;
+    if (override && fs.existsSync(override)) found.push({ path: override, source: 'SKOOL_FFMPEG_PATH' });
+
+    const bundled = await findBundledFfmpeg();
+    if (bundled && fs.existsSync(bundled)) found.push({ path: bundled, source: 'bundled' });
+
+    const system = findFfmpegOnPath();
+    if (system) found.push({ path: system, source: 'system' });
+
+    const seen = new Set<string>();
+    const candidates: FfmpegCandidate[] = [];
+    for (const entry of found) {
+        const key = fs.realpathSync(entry.path);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const version = await probeFfmpegVersion(entry.path);
+        if (version !== undefined) candidates.push({ ...entry, version });
     }
 
-    // Kept even when the bundled copy exists: ffmpeg-static 5.3.0 (ffmpeg
-    // 7.0.2) segfaults in its MPEG-TS demuxer on some Loom HLS streams, and a
-    // system build is the first thing to retry the merge with.
-    const systemFfmpeg = findFfmpegOnPath();
-    if (systemFfmpeg) candidates.push(systemFfmpeg);
+    const pinned = candidates.filter(c => c.source === 'SKOOL_FFMPEG_PATH');
+    const ranked = candidates
+        .filter(c => c.source !== 'SKOOL_FFMPEG_PATH')
+        .sort((a, b) => compareVersionsDesc(parseFfmpegVersion(a.version), parseFfmpegVersion(b.version)));
+    return [...pinned, ...ranked];
+}
 
-    const unique = [...new Set(candidates)];
-    if (unique.length === 0) throw new Error(FFMPEG_INSTALL_HINT);
-    return unique;
+/**
+ * Fetches the bundled ffmpeg by running ffmpeg-static's own installer, which
+ * picks the build for this OS and architecture. Needed when npm skipped the
+ * install script (npm 12+ without the allowScripts entry, --ignore-scripts)
+ * or the download failed during `npm install`.
+ */
+export async function installBundledFfmpeg(): Promise<string> {
+    let installer: string;
+    try {
+        installer = createRequire(import.meta.url).resolve('ffmpeg-static/install.js');
+    } catch {
+        throw new Error('The ffmpeg-static package is not installed. Run "npm install" first, or install ffmpeg yourself.');
+    }
+
+    try {
+        await execFileAsync(process.execPath, [installer], {
+            cwd: path.dirname(installer),
+            timeout: 10 * 60_000,
+            // Set by some setups to point the package elsewhere; the installer
+            // must write into the package folder.
+            env: { ...process.env, FFMPEG_BIN: '' }
+        });
+    } catch (err: any) {
+        const detail = String(err?.stderr || err?.message || err).trim().split('\n').slice(-3).join(' ');
+        throw new Error(`Downloading ffmpeg failed: ${detail}`);
+    }
+
+    const bundled = await findBundledFfmpeg();
+    if (!bundled || (await probeFfmpegVersion(bundled)) === undefined) {
+        throw new Error('ffmpeg was downloaded but does not run on this machine.');
+    }
+    return bundled;
+}
+
+async function resolveFfmpegPaths(logger: Logger): Promise<string[]> {
+    const candidates = await findFfmpegCandidates();
+    if (candidates.length === 0) throw new Error(FFMPEG_INSTALL_HINT);
+    const [best] = candidates;
+    logger.info(`🎞️  Using ffmpeg ${best!.version ?? '(unknown version)'} (${best!.source}): ${best!.path}`);
+    return candidates.map(c => c.path);
 }
 
 const STALE_EXTRACTOR_HINT = [
@@ -488,7 +589,7 @@ export class Downloader {
             // re-awaits this rejected promise instead of finding ytDlp set,
             // skipping init, and quietly downloading unmerged streams. It also
             // reports the problem before the 36 MB yt-dlp download, not after.
-            this.ffmpegPaths = await resolveFfmpegPaths();
+            this.ffmpegPaths = await resolveFfmpegPaths(this.logger);
 
             await fs.ensureDir(BIN_DIR);
 
