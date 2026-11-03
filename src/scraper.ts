@@ -1,7 +1,9 @@
-import { chromium, type Browser, type BrowserContext } from 'playwright';
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import fs from 'fs-extra';
 import { createConsoleLogger, type Logger } from './logger.js';
 import { STORAGE_STATE_PATH } from './auth.js';
+import { escapeHtml } from './utils.js';
+import { renderPostMarkdown } from './linked-posts.js';
 
 export interface Resource {
     title: string;
@@ -12,6 +14,20 @@ export interface Resource {
     isExternal?: boolean;
 }
 
+export interface LinkedPost {
+    id: string;
+    name: string;
+    title: string;
+    url: string;
+    authorName: string;
+    createdAt?: string;
+    contentHtml: string;
+    attachments: Resource[];
+    // The post page could not be read, so this holds only what the lesson page
+    // carries: text cut at metadata.contentLimit and no attachments.
+    incomplete: boolean;
+}
+
 export interface Lesson {
     id: string;
     title: string;
@@ -20,6 +36,7 @@ export interface Lesson {
     contentHtml?: string;
     videoLink?: string;
     resources?: Resource[];
+    linkedPosts?: LinkedPost[];
 }
 
 export interface Module {
@@ -55,6 +72,8 @@ export interface CourseLibraryResult {
     courses: CourseListItem[];
 }
 
+const POST_NAVIGATION_DELAY_MS = 2000;
+
 function resolveClassroomRootUrl(inputUrl: string) {
     const urlObj = new URL(inputUrl);
     const segments = urlObj.pathname.split('/').filter(Boolean);
@@ -69,6 +88,28 @@ function resolveClassroomRootUrl(inputUrl: string) {
     urlObj.search = '';
     urlObj.hash = '';
     return urlObj.toString();
+}
+
+// Skool sends visitors without access to a group's classroom to its /about
+// landing page, whose __NEXT_DATA__ carries no course data at all.
+function assertClassroomAccess(nextData: any, requestedUrl: string) {
+    if (nextData?.page !== '/[group]/about') return;
+
+    const pageProps = nextData.props?.pageProps || {};
+    const groupName = pageProps.currentGroup?.metadata?.displayName || pageProps.currentGroup?.name || 'this community';
+    const accountName = pageProps.self?.name;
+
+    if (!accountName) {
+        throw new Error(
+            `Skool redirected ${requestedUrl} to the "${groupName}" about page because you are not logged in. ` +
+            `Run "skool login" and try again.`
+        );
+    }
+    throw new Error(
+        `Skool redirected ${requestedUrl} to the "${groupName}" about page: the logged-in account "${accountName}" ` +
+        `is not a member of this community, or its membership has expired. ` +
+        `Join it with this account, or run "skool login" with the account that is a member.`
+    );
 }
 
 export class Scraper {
@@ -111,6 +152,7 @@ export class Scraper {
         await page.close();
 
         if (!nextData) throw new Error('Could not find __NEXT_DATA__ on classroom page');
+        assertClassroomAccess(nextData, cleanUrl);
 
         const pageProps = nextData.props?.pageProps || {};
         const courseData = pageProps.course;
@@ -238,6 +280,7 @@ export class Scraper {
         await page.close();
 
         if (!nextData) throw new Error('Could not find __NEXT_DATA__ on classroom page');
+        assertClassroomAccess(nextData, classroomUrl);
 
         const pageProps = nextData.props?.pageProps || {};
         const allCourses = pageProps.allCourses || pageProps.renderData?.allCourses || [];
@@ -503,15 +546,17 @@ export class Scraper {
             }
         }
 
+        const linkedPosts = await this.extractLinkedPosts(page, pageProps.pinnedPosts, urlObj);
+
         await page.close();
 
         // Skool stores rich text as a stringified JSON array or primitive HTML
         let body = metadata.desc || foundLesson?.body || '';
 
         // If it looks like [v2][{"type"...}], it's TipTap/JSON format
-        if (typeof body === 'string' && body.startsWith('[v2]')) {
+        if (typeof body === 'string' && (body.startsWith('[v2]') || (body.startsWith('[') && body.includes('"type"')))) {
             try {
-                const jsonPart = body.substring(4);
+                const jsonPart = body.startsWith('[v2]') ? body.substring(4) : body;
                 const nodes = JSON.parse(jsonPart);
                 body = this.parseTipTap(nodes);
             } catch (e) {
@@ -525,48 +570,156 @@ export class Scraper {
             url: url,
             contentHtml: body,
             videoLink: vLink,
-            resources: resources
+            resources: resources,
+            linkedPosts
         };
+    }
+
+    // Community posts pinned to a lesson show up as cards under its body. The
+    // lesson's pageProps.pinnedPosts lists them but truncates the text at
+    // metadata.contentLimit and leaves out attachmentsData, so each post's own
+    // page is the source of truth. This navigates `page` away from the lesson.
+    private async extractLinkedPosts(page: Page, pinnedPosts: unknown, lessonUrl: URL): Promise<LinkedPost[]> {
+        if (!Array.isArray(pinnedPosts) || pinnedPosts.length === 0) return [];
+
+        const groupSlug = lessonUrl.pathname.split('/').filter(Boolean)[0];
+        const linkedPosts: LinkedPost[] = [];
+
+        for (const entry of pinnedPosts) {
+            const pinned = entry?.post;
+            if (!pinned?.name) continue;
+
+            const url = `${lessonUrl.origin}/${groupSlug}/${pinned.name}`;
+            let fullPost: any = null;
+            try {
+                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                const nextData = await page.evaluate(() => {
+                    const script = document.getElementById('__NEXT_DATA__');
+                    return script ? JSON.parse(script.innerText) : null;
+                });
+                const post = nextData?.props?.pageProps?.postTree?.post;
+                if (post?.id === pinned.id) fullPost = post;
+            } catch (err) {
+                this.logger.warn(`    ⚠️ Failed to open post ${url}: ${String(err)}`);
+            }
+            if (!fullPost) {
+                this.logger.warn(`    ⚠️ Keeping the partial copy of post ${url} from the lesson page.`);
+            }
+
+            const post = fullPost ?? pinned;
+            const metadata = post.metadata || {};
+            const user = post.user || {};
+            linkedPosts.push({
+                id: post.id,
+                name: post.name,
+                title: metadata.title || post.name,
+                url,
+                authorName: [user.firstName, user.lastName].filter(Boolean).join(' ') || user.name || '',
+                createdAt: post.createdAt,
+                contentHtml: renderPostMarkdown(metadata.content || ''),
+                attachments: this.parsePostAttachments(metadata.attachmentsData, url),
+                incomplete: !fullPost
+            });
+
+            // Every post is one more navigation on top of the lesson's own, and
+            // CloudFront answers bursts of them with a 403 for the whole site.
+            await page.waitForTimeout(POST_NAVIGATION_DELAY_MS);
+        }
+
+        this.logger.info(`    📌 Found ${linkedPosts.length} community posts linked to this lesson.`);
+        return linkedPosts;
+    }
+
+    private parsePostAttachments(attachmentsData: unknown, postUrl: string): Resource[] {
+        if (typeof attachmentsData !== 'string' || !attachmentsData) return [];
+        try {
+            const attachments: any[] = JSON.parse(attachmentsData);
+            return attachments
+                .filter(a => a?.metadata?.read_url)
+                .map(a => ({
+                    title: a.metadata.file_name || a.id,
+                    file_id: a.id,
+                    file_name: a.metadata.file_name,
+                    file_content_type: a.metadata.content_type,
+                    downloadUrl: a.metadata.read_url
+                }));
+        } catch (err) {
+            this.logger.warn(`    ⚠️ Failed to parse attachments of post ${postUrl}: ${String(err)}`);
+            return [];
+        }
     }
 
     // Helper removed as logic is now in extractLessonData for shared state
 
-
     private parseTipTap(nodes: any[]): string {
+        if (!Array.isArray(nodes)) return '';
         return nodes.map(node => {
+            if (!node) return '';
+
             if (node.type === 'paragraph') {
                 return `<p>${this.parseTipTapContent(node.content)}</p>`;
             }
             if (node.type === 'hardBreak') {
                 return '<br/>';
             }
+            if (node.type === 'horizontalRule') {
+                return '<hr/>';
+            }
             if (node.type === 'bulletList') {
                 return `<ul>${this.parseTipTap(node.content)}</ul>`;
             }
             if (node.type === 'orderedList') {
-                return `<ol>${this.parseTipTap(node.content)}</ol>`;
+                const start = node.attrs?.start ? ` start="${node.attrs.start}"` : '';
+                return `<ol${start}>${this.parseTipTap(node.content)}</ol>`;
             }
             if (node.type === 'listItem') {
                 return `<li>${this.parseTipTap(node.content)}</li>`;
             }
             if (node.type === 'heading') {
-                const level = node.attrs?.level || 2;
+                const level = Math.min(Math.max(node.attrs?.level || 2, 1), 6);
                 return `<h${level}>${this.parseTipTapContent(node.content)}</h${level}>`;
             }
+            if (node.type === 'codeBlock' || node.type === 'code_block') {
+                const rawCode = Array.isArray(node.content)
+                    ? node.content.map((c: any) => c.text || '').join('')
+                    : (node.text || '');
+                const lang = node.attrs?.language ? ` class="language-${escapeHtml(node.attrs.language)}"` : '';
+                return `<pre><code${lang}>${escapeHtml(rawCode)}</code></pre>`;
+            }
             if (node.type === 'image' || node.type === 'image-block' || (node.attrs && node.attrs.src)) {
-                 const src = node.attrs.src || node.attrs.url || node.attrs.originalSrc;
-                 const alt = node.attrs.alt || '';
-                 if (src) {
+                const src = node.attrs.src || node.attrs.url || node.attrs.originalSrc;
+                const alt = escapeHtml(node.attrs.alt || '');
+                if (src) {
                     return `<img src="${src}" alt="${alt}" />`;
-                 }
+                }
             }
             if (node.type === 'blockquote') {
-                 return `<blockquote>${this.parseTipTap(node.content)}</blockquote>`;
+                return `<blockquote>${this.parseTipTap(node.content)}</blockquote>`;
+            }
+            if (node.type === 'table') {
+                return `<table>${this.parseTipTap(node.content)}</table>`;
+            }
+            if (node.type === 'tableRow') {
+                return `<tr>${this.parseTipTap(node.content)}</tr>`;
+            }
+            if (node.type === 'tableHeader') {
+                return `<th>${this.parseTipTap(node.content)}</th>`;
+            }
+            if (node.type === 'tableCell') {
+                return `<td>${this.parseTipTap(node.content)}</td>`;
+            }
+            if (node.type === 'text') {
+                return this.parseTipTapContent([node]);
             }
 
             // Fallback for nested content in unknown blocks
-            if (node.content) {
-                return `<div>${this.parseTipTap(node.content)}</div>`;
+            if (node.content && Array.isArray(node.content)) {
+                const hasBlockChildren = node.content.some((child: any) => child && child.type !== 'text' && child.type !== 'hardBreak');
+                if (hasBlockChildren) {
+                    return `<div>${this.parseTipTap(node.content)}</div>`;
+                } else {
+                    return `<div>${this.parseTipTapContent(node.content)}</div>`;
+                }
             }
 
             return '';
@@ -574,14 +727,22 @@ export class Scraper {
     }
 
     private parseTipTapContent(content: any[]): string {
-        if (!content) return '';
+        if (!Array.isArray(content)) return '';
         return content.map(item => {
+            if (!item) return '';
             if (item.type === 'text') {
-                let text = item.text;
-                if (item.marks) {
+                let text = escapeHtml(item.text || '');
+                if (item.marks && Array.isArray(item.marks)) {
                     item.marks.forEach((mark: any) => {
                         if (mark.type === 'bold') text = `<b>${text}</b>`;
-                        if (mark.type === 'link') text = `<a href="${mark.attrs.href}">${text}</a>`;
+                        if (mark.type === 'italic') text = `<i>${text}</i>`;
+                        if (mark.type === 'strike') text = `<s>${text}</s>`;
+                        if (mark.type === 'underline') text = `<u>${text}</u>`;
+                        if (mark.type === 'code') text = `<code>${text}</code>`;
+                        if (mark.type === 'link') {
+                            const href = escapeHtml(mark.attrs?.href || '#');
+                            text = `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+                        }
                     });
                 }
                 return text;

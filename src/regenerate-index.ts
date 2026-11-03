@@ -1,5 +1,7 @@
 import fs from 'fs-extra';
 import path from 'path';
+import { formatDate } from './utils.js';
+import { renderLessonProgressScript, renderProgressScript } from './progress-sync.js';
 
 type CourseManifest = {
     courseName: string;
@@ -40,7 +42,133 @@ async function writeAtomicHtml(filePath: string, content: string) {
  */
 type RegenerateOptions = {
     silent?: boolean;
+    // Adds the "done" tick and progress script to lesson pages saved by older
+    // versions. Off for the regeneration that runs after every lesson of a
+    // download: those pages already have both, and patching all of them each
+    // time rewrote every lesson page once per lesson finished.
+    patchLessons?: boolean;
 };
+
+async function patchLessonHtml(indexPath: string, lessonId: string) {
+    if (!await fs.pathExists(indexPath)) return;
+    try {
+        const original = await fs.readFile(indexPath, 'utf-8');
+        let html = original;
+
+        const buttonHtml = `<button type="button" class="lesson-title-tick" id="lessonTickBtn" data-lesson-id="${lessonId}" title="Marcar como realizada" aria-label="Marcar como realizada"><svg viewBox="0 0 20 20" fill="none"><path d="M4.5 10.5L8 14L15.5 5.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>`;
+
+        if (!html.includes('.lesson-title-tick {')) {
+            const css = `
+                                    .lesson-title-tick {
+                                        display: inline-flex;
+                                        align-items: center;
+                                        justify-content: center;
+                                        width: 34px;
+                                        height: 34px;
+                                        border-radius: 50%;
+                                        background: #ffffff;
+                                        border: 2.5px solid #cbd5e1;
+                                        color: #94a3b8;
+                                        margin-left: 14px;
+                                        vertical-align: middle;
+                                        cursor: pointer;
+                                        transition: all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                                        padding: 0;
+                                        position: relative;
+                                        top: -3px;
+                                        flex-shrink: 0;
+                                        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.06);
+                                    }
+                                    .lesson-title-tick svg { width: 18px; height: 18px; }
+                                    .lesson-title-tick:hover { border-color: #94a3b8; color: #64748b; transform: scale(1.12); }
+                                    .lesson-title-tick.is-completed {
+                                        background: #10b981;
+                                        border-color: #10b981;
+                                        color: #ffffff;
+                                        box-shadow: 0 3px 12px rgba(16, 185, 129, 0.45);
+                                        animation: tickPop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                                    }
+                                    @keyframes tickPop {
+                                        0% { transform: scale(0.8); }
+                                        50% { transform: scale(1.18); }
+                                        100% { transform: scale(1); }
+                                    }
+`;
+            if (html.includes('</style>')) {
+                html = html.replace('</style>', `${css}                                </style>`);
+            }
+        }
+
+        if (html.includes('class="lesson-title-tick"')) {
+            html = html.replace(/<button[^>]*class="lesson-title-tick"[^>]*>[\s\S]*?<\/button>/, buttonHtml);
+        } else if (/<h1[^>]*>([\s\S]*?)<\/h1>/.test(html)) {
+            html = html.replace(/<h1([^>]*)>([\s\S]*?)<\/h1>/, (match, attrs, content) => {
+                return `<h1${attrs}>${content.trim()} ${buttonHtml}</h1>`;
+            });
+        }
+
+        if (!html.includes('.sync-pill')) {
+            const css = `
+                                    .sync-pill {
+                                        position: fixed;
+                                        bottom: 18px;
+                                        right: 18px;
+                                        z-index: 99999;
+                                        display: inline-flex;
+                                        align-items: center;
+                                        gap: 8px;
+                                        padding: 7px 14px;
+                                        background: #0f172a;
+                                        color: #f8fafc;
+                                        font-size: 0.8rem;
+                                        font-weight: 500;
+                                        border-radius: 9999px;
+                                        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+                                        border: 1px solid rgba(255, 255, 255, 0.14);
+                                        font-family: inherit;
+                                        transition: all 0.25s ease;
+                                        user-select: none;
+                                    }
+                                    .sync-pill .sync-dot {
+                                        width: 8px;
+                                        height: 8px;
+                                        border-radius: 50%;
+                                        background: #f59e0b;
+                                        flex-shrink: 0;
+                                        transition: background 0.2s ease, box-shadow 0.2s ease;
+                                    }
+                                    .sync-pill.is-connected .sync-dot {
+                                        background: #10b981;
+                                        box-shadow: 0 0 8px #10b981;
+                                    }
+                                    .sync-pill a {
+                                        color: #38bdf8;
+                                        text-decoration: none;
+                                        font-weight: 600;
+                                    }
+                                    .sync-pill a:hover {
+                                        text-decoration: underline;
+                                    }
+`;
+            if (html.includes('</style>')) {
+                html = html.replace('</style>', `${css}                                </style>`);
+            }
+        }
+
+        const script = renderLessonProgressScript();
+        if (/<script>[\s\S]*?STORAGE_KEY\s*=\s*'cerebro_completed_lessons'[\s\S]*?<\/script>/.test(html)) {
+            html = html.replace(/<script>[\s\S]*?STORAGE_KEY\s*=\s*'cerebro_completed_lessons'[\s\S]*?<\/script>/, script.trim());
+        } else if (html.includes('</body>')) {
+            html = html.replace('</body>', `${script}\n                            </body>`);
+        }
+
+        // The button and script are always swapped for the current version,
+        // so compare instead of tracking whether anything was replaced.
+        if (html !== original) {
+            await writeAtomicHtml(indexPath, html);
+        }
+    } catch {}
+}
 
 async function regenerateIndex(
     downloadsDir: string = path.join(process.cwd(), 'downloads'),
@@ -54,6 +182,7 @@ async function regenerateIndex(
         return;
     }
 
+    const courseDirName = path.basename(downloadsDir);
     log(`🔍 Scanning downloads directory: ${downloadsDir}`);
 
     let courseManifest: CourseManifest | null = null;
@@ -146,6 +275,10 @@ async function regenerateIndex(
                     moduleTitleOverride,
                     moduleIndexOverride
                 });
+
+                if (options.patchLessons !== false) {
+                    await patchLessonHtml(indexPath, `${courseDirName}/${relativePath.replace(/\\/g, '/')}`);
+                }
             }
         }
 
@@ -203,6 +336,10 @@ async function regenerateIndex(
                     moduleTitleOverride,
                     moduleIndexOverride
                 });
+
+                if (options.patchLessons !== false) {
+                    await patchLessonHtml(indexPath, `${courseDirName}/${relativePath.replace(/\\/g, '/')}`);
+                }
             }
         }
 
@@ -219,21 +356,28 @@ async function regenerateIndex(
         }
     }
 
-    if (courseManifest?.modules?.length) {
-        const order = new Map(courseManifest.modules.map((m, i) => [m.moduleDirName, i]));
-        courseInfo.sort((a, b) => {
+    courseInfo.sort((a, b) => {
+        if (a.index !== b.index) return a.index - b.index;
+        if (courseManifest?.modules?.length) {
+            const order = new Map(courseManifest.modules.map((m, i) => [m.moduleDirName, i]));
             const orderA = order.get(a.moduleDirName) ?? 9999;
             const orderB = order.get(b.moduleDirName) ?? 9999;
             if (orderA !== orderB) return orderA - orderB;
-            return a.index - b.index;
-        });
-    } else {
-        courseInfo.sort((a, b) => a.index - b.index);
-    }
+        }
+        return (a.title || '').localeCompare(b.title || '');
+    });
 
     const courseName = courseManifest?.courseName || 'Course Archive';
     const groupName = courseManifest?.groupName || '';
-    const courseImagePath = courseManifest?.courseImagePath;
+    let courseImagePath = courseManifest?.courseImagePath;
+    if (!courseImagePath) {
+        for (const ext of [".jpg", ".jpeg", ".png", ".webp"]) {
+            if (await fs.pathExists(path.join(downloadsDir, `assets/course-cover${ext}`))) {
+                courseImagePath = `assets/course-cover${ext}`;
+                break;
+            }
+        }
+    }
     const resolvedCourseImagePath = courseImagePath
         ? path.join(downloadsDir, courseImagePath)
         : null;
@@ -276,7 +420,7 @@ async function regenerateIndex(
                         display: grid;
                         grid-template-columns: 1fr;
                         gap: 28px;
-                        align-items: stretch;
+                        align-items: center;
                         background: var(--panel);
                         border-radius: 28px;
                         padding: 32px;
@@ -329,16 +473,21 @@ async function regenerateIndex(
                         position: relative;
                         border-radius: 18px;
                         overflow: hidden;
-                        background: #f0f2f7;
-                        height: 100%;
+                        background: #020617;
                         border: 1px solid var(--ring);
                         box-shadow: 0 16px 28px rgba(15, 23, 42, 0.14);
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        align-self: center;
+                        width: 100%;
+                        max-height: 320px;
                     }
                     .hero-image img {
                         width: 100%;
-                        height: 100%;
-                        object-fit: cover;
-                        background: #f0f2f7;
+                        height: auto;
+                        max-height: 320px;
+                        object-fit: contain;
                         display: block;
                     }
                     .hero-image .fallback {
@@ -393,7 +542,10 @@ async function regenerateIndex(
                         list-style: none;
                     }
                     .lesson a {
-                        display: block;
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 12px;
                         padding: 12px 14px;
                         border-radius: 14px;
                         background: var(--panel-2);
@@ -410,11 +562,93 @@ async function regenerateIndex(
                         border-color: rgba(59,130,246,0.6);
                         transform: translateY(-2px);
                     }
+                    .lesson-title-text {
+                        flex: 1;
+                    }
+                    .course-tick {
+                        display: inline-flex;
+                        align-items: center;
+                        justify-content: center;
+                        width: 22px;
+                        height: 22px;
+                        min-width: 22px;
+                        border-radius: 50%;
+                        background: #ffffff;
+                        border: 2px solid #cbd5e1;
+                        color: #94a3b8;
+                        margin-left: auto;
+                        cursor: pointer;
+                        transition: all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                        padding: 0;
+                        flex-shrink: 0;
+                        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+                    }
+                    .course-tick svg {
+                        width: 13px;
+                        height: 13px;
+                    }
+                    .course-tick:hover {
+                        border-color: #94a3b8;
+                        color: #64748b;
+                        transform: scale(1.15);
+                    }
+                    .course-tick.is-completed {
+                        background: #10b981;
+                        border-color: #10b981;
+                        color: #ffffff;
+                        box-shadow: 0 2px 8px rgba(16, 185, 129, 0.4);
+                        animation: tickPop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                    }
+                    @keyframes tickPop {
+                        0% { transform: scale(0.8); }
+                        50% { transform: scale(1.18); }
+                        100% { transform: scale(1); }
+                    }
+                    .sync-pill {
+                        position: fixed;
+                        bottom: 18px;
+                        right: 18px;
+                        z-index: 99999;
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 8px;
+                        padding: 7px 14px;
+                        background: #0f172a;
+                        color: #f8fafc;
+                        font-size: 0.8rem;
+                        font-weight: 500;
+                        border-radius: 9999px;
+                        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+                        border: 1px solid rgba(255, 255, 255, 0.14);
+                        font-family: inherit;
+                        transition: all 0.25s ease;
+                        user-select: none;
+                    }
+                    .sync-pill .sync-dot {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 50%;
+                        background: #f59e0b;
+                        flex-shrink: 0;
+                        transition: background 0.2s ease, box-shadow 0.2s ease;
+                    }
+                    .sync-pill.is-connected .sync-dot {
+                        background: #10b981;
+                        box-shadow: 0 0 8px #10b981;
+                    }
+                    .sync-pill a {
+                        color: #38bdf8;
+                        text-decoration: none;
+                        font-weight: 600;
+                    }
+                    .sync-pill a:hover {
+                        text-decoration: underline;
+                    }
                     @media (min-width: 900px) {
                         .hero { grid-template-columns: 1.15fr 0.85fr; }
                     }
                     @media (max-width: 640px) {
-                        .hero-image { min-height: 200px; }
+                        .hero-image { min-height: auto; }
                     }
                 </style>
             </head>
@@ -432,9 +666,10 @@ async function regenerateIndex(
                             <h1 class="hero-title">${courseName}</h1>
                             <p class="hero-subtitle">${groupName ? `Community: ${groupName}` : 'Course Archive'}</p>
                             <div class="hero-meta">
+                                <div class="chip" id="courseProgressChip">Progreso: <strong>0 / ${courseInfo.reduce((acc, m) => acc + m.lessons.length, 0)}</strong> completadas</div>
                                 <div class="chip"><strong>${courseInfo.reduce((acc, m) => acc + m.lessons.length, 0)}</strong> lessons</div>
                                 <div class="chip"><strong>${courseInfo.length}</strong> modules</div>
-                                <div class="chip">Updated: <strong>${new Date().toLocaleDateString()}</strong></div>
+                                <div class="chip">Updated: <strong>${formatDate(courseManifest?.updatedAt || new Date())}</strong></div>
                             </div>
                         </div>
                         <div class="hero-image">
@@ -449,12 +684,50 @@ async function regenerateIndex(
                             <div class="module">
                                 <h2 class="module-title"><span>Module ${m.index}</span>${m.title}</h2>
                                 <ul class="lesson-list">
-                                    ${m.lessons.map((l: any) => `<li class="lesson"><a href="${l.path}">${l.title}</a></li>`).join('')}
+                                    ${m.lessons.map((l: any) => `
+                                        <li class="lesson">
+                                            <a href="${l.path}">
+                                                <span class="lesson-title-text">${l.title}</span>
+                                                <span class="course-tick" data-lesson-id="${courseDirName}/${l.path.replace(/\\/g, '/')}" role="button" title="Marcar como realizada" aria-label="Marcar como realizada">
+                                                    <svg viewBox="0 0 20 20" fill="none"><path d="M4.5 10.5L8 14L15.5 5.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                                </span>
+                                            </a>
+                                        </li>
+                                    `).join('')}
                                 </ul>
                             </div>
                         `).join('')}
                     </section>
                 </div>
+                ${renderProgressScript(`
+    function render(data) {
+        const ticks = document.querySelectorAll('.course-tick');
+        let count = 0;
+        ticks.forEach(t => {
+            const isDone = !!data[t.getAttribute('data-lesson-id')];
+            t.classList.toggle('is-completed', isDone);
+            t.setAttribute('aria-pressed', isDone ? 'true' : 'false');
+            t.setAttribute('title', isDone ? 'Completada (clic para desmarcar)' : 'Marcar como realizada');
+            if (isDone) count++;
+        });
+        const chip = document.getElementById('courseProgressChip');
+        if (chip) chip.innerHTML = 'Progreso: <strong>' + count + ' / ' + ticks.length + '</strong> completadas';
+    }
+
+    document.addEventListener('click', (e) => {
+        const tick = e.target.closest('.course-tick');
+        if (!tick) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const id = tick.getAttribute('data-lesson-id');
+        const data = getCompleted();
+        if (data[id]) delete data[id]; else data[id] = true;
+        saveCompleted(data, true);
+        render(data);
+    });
+
+    startProgressSync(render);
+`)}
             </body>
             </html>
         `;
