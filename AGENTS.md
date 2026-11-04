@@ -19,7 +19,7 @@ The goal of this project is to provide a robust, platform-independent tool for c
 3. **Cookie Conversion**:
    The tool automatically converts Playwright's JSON cookies into the **Netscape format** (`cookies.txt`) required by `yt-dlp` to access private course videos.
 4. **Rich Text Parsing**:
-   Skool uses TipTap/ProseMirror for lesson content. The scraper includes a parser (`parseTipTap`) to convert the stringified JSON content back into clean, localizable HTML.
+   Skool uses TipTap/ProseMirror for lesson content. The scraper includes a parser (`parseTipTap`) to convert the stringified JSON content back into clean, localizable HTML. Skool renames some nodes: the bullet list is `unorderedList` (not `bulletList`), and mentions are inline `user-mention` (`@label`) and `course-reference` (`#label`) nodes whose text is only in `attrs.label`. An unknown block type falls back to a `<div>`, which for a list leaves bare `<li>`s that break the surrounding list; an unknown inline node is dropped with its text.
 5. **Asset Localization**:
    The `Downloader` class identifies `<img>` tags, downloads the images into a local `assets/` folder, and rewrites the HTML sources before saving.
 6. **Native Video Extraction**:
