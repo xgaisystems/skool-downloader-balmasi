@@ -84,6 +84,8 @@ export interface ClassroomResult {
     groupName: string;
     courseName: string;
     courseImageUrl?: string;
+    // Where the course sits in the community's classroom, from 0.
+    coursePosition?: number;
     modules: Module[];
 }
 
@@ -258,6 +260,14 @@ export class Scraper {
                 foundCourse?.metadata?.coverSmallUrl;
         }
 
+        // allCourses lists every course of the community in the order the
+        // classroom shows them.
+        const allCourses: any[] = pageProps.allCourses || pageProps.renderData?.allCourses || [];
+        const courseHandle = cleanUrl.split('/').filter(Boolean).pop();
+        const courseId = courseData.course?.id || courseData.id;
+        const positionIndex = allCourses.findIndex((c: any) => c?.name === courseHandle || (courseId && c?.id === courseId));
+        const coursePosition = positionIndex >= 0 ? positionIndex : undefined;
+
         this.logger.info(`🎓 Course detected: ${courseName}`);
 
         // Skool Hierarchy:
@@ -314,6 +324,7 @@ export class Scraper {
             groupName,
             courseName,
             courseImageUrl,
+            coursePosition,
             modules: modules.filter(m => m.lessons.length > 0)
         };
     }
@@ -946,7 +957,9 @@ export class Scraper {
             if (node.type === 'horizontalRule') {
                 return '<hr/>';
             }
-            if (node.type === 'bulletList') {
+            // Skool's editor names its bullet list unorderedList; an unknown
+            // type fell through to the <div> fallback and left bare <li>s.
+            if (node.type === 'bulletList' || node.type === 'unorderedList') {
                 return `<ul>${this.parseTipTap(node.content)}</ul>`;
             }
             if (node.type === 'orderedList') {
@@ -1029,6 +1042,10 @@ export class Scraper {
                 return text;
             }
             if (item.type === 'hardBreak') return '<br/>';
+            // Mentions of a member (@) or a lesson (#). Their text is only in
+            // the label, so skipping them dropped it from the sentence.
+            if (item.type === 'user-mention') return escapeHtml(`@${item.attrs?.label ?? ''}`);
+            if (item.type === 'course-reference') return escapeHtml(`#${item.attrs?.label ?? ''}`);
             return '';
         }).join('');
     }
