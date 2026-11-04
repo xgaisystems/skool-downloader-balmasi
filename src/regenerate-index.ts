@@ -1,6 +1,6 @@
 import fs from 'fs-extra';
 import path from 'path';
-import { formatDate } from './utils.js';
+import { formatDate, resolveDownloadsDir } from './utils.js';
 import { renderLessonProgressScript, renderProgressScript } from './progress-sync.js';
 
 type CourseManifest = {
@@ -171,7 +171,7 @@ async function patchLessonHtml(indexPath: string, lessonId: string) {
 }
 
 async function regenerateIndex(
-    downloadsDir: string = path.join(process.cwd(), 'downloads'),
+    downloadsDir: string = resolveDownloadsDir(),
     options: RegenerateOptions = {}
 ) {
     const log = options.silent ? () => {} : console.log;
@@ -742,7 +742,7 @@ async function regenerateIndex(
 
 // Run if called directly
 if (import.meta.url === `file://${process.argv[1]}`) {
-    const downloadsDir = process.argv[2] || path.join(process.cwd(), 'downloads');
+    const downloadsDir = process.argv[2] || resolveDownloadsDir();
     regenerateIndex(downloadsDir).catch(console.error);
 }
 

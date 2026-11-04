@@ -4,3 +4,4 @@ cookies.txt
 storage_state.json
 node_modules
 node_modules/*
+.env

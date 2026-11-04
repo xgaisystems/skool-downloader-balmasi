@@ -2,7 +2,7 @@ import { Scraper, Module } from './scraper.js';
 import { Downloader, summarizeVideoError } from './downloader.js';
 import { LINKED_POSTS_CSS, renderLinkedPosts, renderLinkedPostSource, type PostLinkResolver } from './linked-posts.js';
 import { saveLinkedPost, type LinkedPostManifest, type SavedLinkedPost } from './linked-post-archive.js';
-import { sanitizeName } from './utils.js';
+import { resolveDownloadsDir, sanitizeName } from './utils.js';
 import { renderLessonProgressScript } from './progress-sync.js';
 import { regenerateIndex } from './regenerate-index.js';
 import { regenerateGroupIndex } from './regenerate-group-index.js';
@@ -334,8 +334,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
         const sanitizedCourseName = sanitizeName(courseName);
 
         const defaultOutputDir = path.join(
-            process.cwd(),
-            'downloads',
+            resolveDownloadsDir(),
             sanitizedGroupName,
             sanitizedCourseName
         );
