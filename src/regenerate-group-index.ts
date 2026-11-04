@@ -6,6 +6,7 @@ import { renderProgressScript } from './progress-sync.js';
 type CourseManifest = {
     courseName: string;
     groupName: string;
+    position?: number;
     courseImageUrl?: string;
     courseImagePath?: string;
     modules: Array<{
@@ -24,6 +25,7 @@ type GroupIndexCourse = {
     modulesCount: number;
     lessonsCount: number;
     lessonIds: string[];
+    position?: number;
     updatedAt?: string;
 };
 
@@ -133,6 +135,7 @@ async function loadCourseInfo(coursePath: string, dirName: string): Promise<Grou
         modulesCount: counts.modulesCount,
         lessonsCount: counts.lessonsCount,
         lessonIds: counts.lessonIds,
+        position: typeof manifest?.position === 'number' ? manifest.position : undefined,
         updatedAt: manifest?.updatedAt
     };
 }
@@ -173,7 +176,14 @@ async function regenerateGroupIndex(
 
     const groupName = resolvedGroupName || path.basename(groupDir);
 
+    // The classroom's order. Courses saved before it was recorded go after,
+    // most recently downloaded first.
     courses.sort((a, b) => {
+        if (a.position !== undefined || b.position !== undefined) {
+            if (a.position === undefined) return 1;
+            if (b.position === undefined) return -1;
+            if (a.position !== b.position) return a.position - b.position;
+        }
         if (a.updatedAt && b.updatedAt) {
             return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
         }
