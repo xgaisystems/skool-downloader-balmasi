@@ -1,3 +1,4 @@
+import './env.js';
 import { intro, outro, select, text, confirm, spinner, isCancel, cancel, log, multiselect } from '@clack/prompts';
 import pc from 'picocolors';
 import path from 'path';
@@ -14,7 +15,7 @@ import { updateYtDlp, rollbackYtDlp, getYtDlpPaths, findFfmpegCandidates, instal
 import { regenerateGroupIndex } from './regenerate-group-index.js';
 import { Scraper, type CourseLibraryResult, type CourseListItem } from './scraper.js';
 import type { Logger } from './logger.js';
-import { formatDateTime } from './utils.js';
+import { formatDateTime, resolveDownloadsDir } from './utils.js';
 import { startServer } from './server.js';
 import { PROGRESS_SERVER_PORT } from './progress-sync.js';
 
@@ -619,8 +620,8 @@ async function runInteractive() {
         const url = String(urlInput);
 
         const outputDir = await text({
-            message: 'Custom output directory (leave empty for default downloads/)',
-            placeholder: path.join(process.cwd(), 'downloads')
+            message: 'Custom output directory (leave empty for the default)',
+            placeholder: resolveDownloadsDir()
         });
         handleCancel(outputDir);
         const outputDirValue = typeof outputDir === 'string' ? outputDir.trim() : '';
@@ -731,7 +732,7 @@ async function runInteractive() {
 
     const outputDir = await text({
         message: 'Custom output directory (leave empty for default)',
-        placeholder: path.join(process.cwd(), 'downloads')
+        placeholder: resolveDownloadsDir()
     });
     handleCancel(outputDir);
 
@@ -812,7 +813,7 @@ async function runYtDlpUpdate(rollback: boolean) {
 }
 
 async function regenerateAllIndexes() {
-    const downloadsRoot = path.join(process.cwd(), 'downloads');
+    const downloadsRoot = resolveDownloadsDir();
     const rootExists = await fs.pathExists(downloadsRoot);
     if (!rootExists) {
         console.log(`Downloads folder not found: ${downloadsRoot}`);
@@ -851,7 +852,7 @@ async function regenerateAllIndexes() {
 }
 
 async function runServe(port?: number, host?: string) {
-    const downloadsDir = path.join(process.cwd(), 'downloads');
+    const downloadsDir = resolveDownloadsDir();
     if (!fs.existsSync(downloadsDir)) {
         await fs.mkdirp(downloadsDir);
     }

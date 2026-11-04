@@ -71,7 +71,8 @@ The goal of this project is to provide a robust, platform-independent tool for c
 - `src/progress-sync.ts`: Browser code for the "done" ticks shared by all generated pages, and `PROGRESS_SERVER_PORT`.
 - `src/server.ts`: `skool serve`, the local static server for `downloads/` with the progress API and SSE.
 - `bin/skool.js`: The published CLI shim. The `yt-dlp` binary lives in the per-user cache folder, not here.
-- `src/utils.ts`: Shared utilities including European date and time formatting (`dd/mm/aaaa`).
+- `src/utils.ts`: Shared utilities including European date and time formatting (`dd/mm/aaaa`) and `resolveDownloadsDir()`, the one place that decides the downloads folder (`SKOOL_DOWNLOADS_DIR`, else `downloads/` under the current directory). A configured folder that is missing, not a folder or not writable falls back to `downloads/` with a warning; only its last segment is created, because creating the parents would write under an unmounted mount point. The result is memoised per run.
+- `src/env.ts`: Loads the gitignored `.env` next to `package.json`. `cli.ts` imports it first because some modules (e.g. `downloader.ts`) read their variables at load time.
 
 ### Date Formatting Standard (European Format: dd/mm/aaaa)
 All user-facing dates across the codebase (HTML index/course templates, chips, course manifests display, CLI output, and log messages) MUST strictly follow the European format: `dd/mm/aaaa` (e.g., `01/10/2026`), or `dd/mm/aaaa HH:mm:ss` when including timestamps with time.
