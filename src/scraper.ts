@@ -3,7 +3,6 @@ import fs from 'fs-extra';
 import { createConsoleLogger, type Logger } from './logger.js';
 import { STORAGE_STATE_PATH } from './auth.js';
 import { escapeHtml } from './utils.js';
-import { renderPostMarkdown } from './linked-posts.js';
 
 export interface Resource {
     title: string;
@@ -14,6 +13,29 @@ export interface Resource {
     isExternal?: boolean;
 }
 
+// A video uploaded to Skool (Mux) inside a post or a comment.
+export interface PostVideo {
+    id: string;
+    // Signed HLS manifest, valid for about a day. Missing when the run skips
+    // videos or Skool returned no playback data for it.
+    streamUrl?: string;
+    durationMs?: number;
+}
+
+export interface PostComment {
+    id: string;
+    authorName: string;
+    createdAt?: string;
+    upvotes: number;
+    pinned: boolean;
+    // Markdown, as written by the member.
+    content: string;
+    attachments: Resource[];
+    videos: PostVideo[];
+    videoLinks: string[];
+    replies: PostComment[];
+}
+
 export interface LinkedPost {
     id: string;
     name: string;
@@ -21,11 +43,21 @@ export interface LinkedPost {
     url: string;
     authorName: string;
     createdAt?: string;
-    contentHtml: string;
+    upvotes: number;
+    // Markdown, as written by the member.
+    content: string;
     attachments: Resource[];
+    videos: PostVideo[];
+    // Links to videos hosted elsewhere (YouTube, Loom...), kept as links.
+    videoLinks: string[];
     // The post page could not be read, so this holds only what the lesson page
-    // carries: text cut at metadata.contentLimit and no attachments.
+    // carries: text cut at metadata.contentLimit, no attachments and no comments.
     incomplete: boolean;
+    // What Skool reports, which can differ from comments saved: deleted ones still count.
+    commentsCount: number;
+    comments: PostComment[];
+    // False when a page of comments could not be fetched.
+    commentsComplete: boolean;
 }
 
 export interface Lesson {
@@ -35,6 +67,8 @@ export interface Lesson {
     index?: number;
     contentHtml?: string;
     videoLink?: string;
+    // Skool's own (Mux) video id, for lessons whose video is hosted on Skool.
+    videoId?: string;
     resources?: Resource[];
     linkedPosts?: LinkedPost[];
 }
@@ -73,6 +107,27 @@ export interface CourseLibraryResult {
 }
 
 const POST_NAVIGATION_DELAY_MS = 2000;
+// Between API calls for one post (pages of comments, files, video tokens).
+const API_REQUEST_DELAY_MS = 500;
+const COMMENTS_PAGE_SIZE = 25;
+// 5000 comments; a guard against a cursor that never ends.
+const MAX_COMMENT_PAGES = 200;
+const FILES_PER_REQUEST = 25;
+
+// The HLS manifest of a Skool-hosted (Mux) video, as the lesson player uses it.
+function muxStreamUrl(playbackId: string, playbackToken: string) {
+    return `https://stream.video.skool.com/${playbackId}.m3u8?token=${playbackToken}`;
+}
+
+// Skool stores lists of ids as comma-separated strings.
+function splitIds(value: unknown): string[] {
+    if (typeof value !== 'string') return [];
+    return value.split(',').map(id => id.trim()).filter(Boolean);
+}
+
+function parseVideoLinks(value: unknown): string[] {
+    return splitIds(value).filter(link => /^https?:\/\//i.test(link));
+}
 
 function resolveClassroomRootUrl(inputUrl: string) {
     const urlObj = new URL(inputUrl);
@@ -331,7 +386,9 @@ export class Scraper {
         };
     }
 
-    async extractLessonData(url: string): Promise<Lesson> {
+    // resolveNativeVideo: false skips the play click that signs a native video's
+    // stream URL, for runs that do not download videos.
+    async extractLessonData(url: string, { resolveNativeVideo = true }: { resolveNativeVideo?: boolean } = {}): Promise<Lesson> {
         if (!this.context) await this.init();
         const page = await this.context!.newPage();
 
@@ -378,7 +435,7 @@ export class Scraper {
         let vLink = metadata.videoLink || foundLesson?.video?.url || '';
 
         // Native Skool Player Handling (Mux)
-        if (!vLink && metadata.videoId) {
+        if (!vLink && metadata.videoId && resolveNativeVideo) {
             this.logger.info(`    ℹ️ Native videoId found: ${metadata.videoId}.`);
 
             try {
@@ -546,7 +603,7 @@ export class Scraper {
             }
         }
 
-        const linkedPosts = await this.extractLinkedPosts(page, pageProps.pinnedPosts, urlObj);
+        const linkedPosts = await this.extractLinkedPosts(page, pageProps.pinnedPosts, urlObj, resolveNativeVideo);
 
         await page.close();
 
@@ -570,6 +627,7 @@ export class Scraper {
             url: url,
             contentHtml: body,
             videoLink: vLink,
+            videoId: metadata.videoId || undefined,
             resources: resources,
             linkedPosts
         };
@@ -578,8 +636,15 @@ export class Scraper {
     // Community posts pinned to a lesson show up as cards under its body. The
     // lesson's pageProps.pinnedPosts lists them but truncates the text at
     // metadata.contentLimit and leaves out attachmentsData, so each post's own
-    // page is the source of truth. This navigates `page` away from the lesson.
-    private async extractLinkedPosts(page: Page, pinnedPosts: unknown, lessonUrl: URL): Promise<LinkedPost[]> {
+    // page is the source of truth. Comments are not in that page: they come
+    // from the API, like the videos of comments. This navigates `page` away
+    // from the lesson.
+    private async extractLinkedPosts(
+        page: Page,
+        pinnedPosts: unknown,
+        lessonUrl: URL,
+        resolveVideos: boolean
+    ): Promise<LinkedPost[]> {
         if (!Array.isArray(pinnedPosts) || pinnedPosts.length === 0) return [];
 
         const groupSlug = lessonUrl.pathname.split('/').filter(Boolean)[0];
@@ -591,14 +656,18 @@ export class Scraper {
 
             const url = `${lessonUrl.origin}/${groupSlug}/${pinned.name}`;
             let fullPost: any = null;
+            let postVideos: any[] = [];
             try {
                 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
                 const nextData = await page.evaluate(() => {
                     const script = document.getElementById('__NEXT_DATA__');
                     return script ? JSON.parse(script.innerText) : null;
                 });
-                const post = nextData?.props?.pageProps?.postTree?.post;
-                if (post?.id === pinned.id) fullPost = post;
+                const postTree = nextData?.props?.pageProps?.postTree;
+                if (postTree?.post?.id === pinned.id) {
+                    fullPost = postTree.post;
+                    postVideos = Array.isArray(postTree.videos) ? postTree.videos : [];
+                }
             } catch (err) {
                 this.logger.warn(`    ⚠️ Failed to open post ${url}: ${String(err)}`);
             }
@@ -609,6 +678,29 @@ export class Scraper {
             const post = fullPost ?? pinned;
             const metadata = post.metadata || {};
             const user = post.user || {};
+
+            let videos: PostVideo[] = [];
+            let comments: PostComment[] = [];
+            let commentsComplete = false;
+            if (fullPost) {
+                // The post page already signed its own videos; only the ones it
+                // left out cost an API call.
+                const known = new Map<string, PostVideo>();
+                for (const v of postVideos) {
+                    if (!v?.id) continue;
+                    known.set(v.id, {
+                        id: v.id,
+                        streamUrl: v.playbackId && v.playbackToken ? muxStreamUrl(v.playbackId, v.playbackToken) : undefined,
+                        durationMs: Number(v.duration) || undefined
+                    });
+                }
+                videos = await this.resolvePostVideos(page, splitIds(metadata.videoIds), known, resolveVideos);
+
+                const fetched = await this.fetchPostComments(page, fullPost, url, resolveVideos);
+                comments = fetched.comments;
+                commentsComplete = fetched.complete;
+            }
+
             linkedPosts.push({
                 id: post.id,
                 name: post.name,
@@ -616,9 +708,15 @@ export class Scraper {
                 url,
                 authorName: [user.firstName, user.lastName].filter(Boolean).join(' ') || user.name || '',
                 createdAt: post.createdAt,
-                contentHtml: renderPostMarkdown(metadata.content || ''),
+                upvotes: Number(metadata.upvotes) || 0,
+                content: metadata.content || '',
                 attachments: this.parsePostAttachments(metadata.attachmentsData, url),
-                incomplete: !fullPost
+                videos,
+                videoLinks: parseVideoLinks(metadata.videoLinks),
+                incomplete: !fullPost,
+                commentsCount: Number(metadata.comments) || 0,
+                comments,
+                commentsComplete
             });
 
             // Every post is one more navigation on top of the lesson's own, and
@@ -628,6 +726,189 @@ export class Scraper {
 
         this.logger.info(`    📌 Found ${linkedPosts.length} community posts linked to this lesson.`);
         return linkedPosts;
+    }
+
+    // Calls Skool's API from `page`, which must be on www.skool.com, so the
+    // request carries the session cookies the same way the site's own does.
+    private async skoolApi(page: Page, method: 'GET' | 'POST', url: string): Promise<{ ok: boolean; status: number; text: string }> {
+        return page.evaluate(async ({ method, url }) => {
+            try {
+                const resp = await fetch(url, { method, credentials: 'include' });
+                return { ok: resp.ok, status: resp.status, text: await resp.text() };
+            } catch (e) {
+                return { ok: false, status: 0, text: String(e) };
+            }
+        }, { method, url });
+    }
+
+    // Comments come 25 at a time, oldest first, each with its replies nested.
+    // The site asks for the next page with created-gt set to the `last` of the
+    // previous one, and stops when `last` is 0.
+    private async fetchPostComments(
+        page: Page,
+        post: any,
+        postUrl: string,
+        resolveVideos: boolean
+    ): Promise<{ comments: PostComment[]; complete: boolean }> {
+        if (!(Number(post.metadata?.comments) > 0)) return { comments: [], complete: true };
+
+        const base = `https://api2.skool.com/posts/${post.id}/comments?group-id=${encodeURIComponent(post.groupId)}&limit=${COMMENTS_PAGE_SIZE}`;
+        const nodes: any[] = [];
+        const seen = new Set<string>();
+        const pinnedIds = new Set<string>();
+        let cursor: string | null = null;
+        let complete = false;
+
+        for (let pageNo = 0; pageNo < MAX_COMMENT_PAGES; pageNo++) {
+            const res = await this.skoolApi(page, 'GET', cursor ? `${base}&created-gt=${cursor}` : `${base}&pinned=true`);
+            if (!res.ok) {
+                this.logger.warn(`    ⚠️ Failed to load comments of post ${postUrl}: HTTP ${res.status}`);
+                break;
+            }
+            let data: any;
+            try {
+                data = JSON.parse(res.text);
+            } catch (err) {
+                this.logger.warn(`    ⚠️ Unreadable comments of post ${postUrl}: ${String(err)}`);
+                break;
+            }
+
+            const pinned: any[] = data?.pinned_post_tree?.children ?? [];
+            for (const node of pinned) {
+                if (node?.post?.id) pinnedIds.add(node.post.id);
+            }
+            let fresh = 0;
+            for (const node of [...pinned, ...(data?.post_tree?.children ?? [])]) {
+                const id = node?.post?.id;
+                if (!id || seen.has(id)) continue;
+                seen.add(id);
+                nodes.push(node);
+                fresh += 1;
+            }
+
+            // `last` is a timestamp in nanoseconds, more digits than a JS
+            // number holds exactly, so it is read from the raw text.
+            const last = res.text.match(/"last":\s*"?(\d+)/)?.[1];
+            if (!last || /^0+$/.test(last) || fresh === 0) {
+                complete = true;
+                break;
+            }
+            cursor = last;
+            await page.waitForTimeout(API_REQUEST_DELAY_MS);
+        }
+
+        const files = await this.resolveCommentFiles(page, nodes, postUrl);
+        const comments: PostComment[] = [];
+        for (const node of nodes) {
+            comments.push(await this.toPostComment(page, node, pinnedIds, files, resolveVideos));
+        }
+        return { comments, complete };
+    }
+
+    private async toPostComment(
+        page: Page,
+        node: any,
+        pinnedIds: Set<string>,
+        files: Map<string, Resource>,
+        resolveVideos: boolean
+    ): Promise<PostComment> {
+        const post = node.post;
+        const metadata = post.metadata || {};
+        const user = post.user || {};
+        const replies: PostComment[] = [];
+        for (const child of node.children ?? []) {
+            if (child?.post?.id) replies.push(await this.toPostComment(page, child, pinnedIds, files, resolveVideos));
+        }
+        return {
+            id: post.id,
+            // The API also returns the member's email, which is never kept.
+            authorName: [user.first_name, user.last_name].filter(Boolean).join(' ') || user.name || '',
+            createdAt: post.created_at,
+            upvotes: Number(metadata.upvotes) || 0,
+            pinned: pinnedIds.has(post.id),
+            content: metadata.content || '',
+            attachments: splitIds(metadata.attachments).map(id => files.get(id)).filter((f): f is Resource => !!f),
+            videos: await this.resolvePostVideos(page, splitIds(metadata.video_ids ?? metadata.videoIds), new Map(), resolveVideos),
+            videoLinks: parseVideoLinks(metadata.video_links ?? metadata.videoLinks),
+            replies
+        };
+    }
+
+    // Comments only carry the ids of their files. One request returns the
+    // names of all of them, and a file without a read_url gets a signed link
+    // the way lesson resources do.
+    private async resolveCommentFiles(page: Page, nodes: any[], postUrl: string): Promise<Map<string, Resource>> {
+        const ids: string[] = [];
+        const collect = (node: any) => {
+            ids.push(...splitIds(node?.post?.metadata?.attachments));
+            for (const child of node?.children ?? []) collect(child);
+        };
+        nodes.forEach(collect);
+
+        const files = new Map<string, Resource>();
+        const unique = [...new Set(ids)];
+        for (let i = 0; i < unique.length; i += FILES_PER_REQUEST) {
+            const chunk = unique.slice(i, i + FILES_PER_REQUEST);
+            const res = await this.skoolApi(page, 'GET', `https://api2.skool.com/files?ids=${chunk.map(encodeURIComponent).join('|')}`);
+            let list: any[] = [];
+            try {
+                if (res.ok) list = JSON.parse(res.text)?.files ?? [];
+                else this.logger.warn(`    ⚠️ Failed to read comment files of post ${postUrl}: HTTP ${res.status}`);
+            } catch (err) {
+                this.logger.warn(`    ⚠️ Unreadable comment files of post ${postUrl}: ${String(err)}`);
+            }
+            for (const id of chunk) {
+                const meta = list.find(f => f?.id === id)?.metadata || {};
+                files.set(id, {
+                    title: meta.file_name || id,
+                    file_id: id,
+                    file_name: meta.file_name,
+                    file_content_type: meta.content_type,
+                    downloadUrl: meta.read_url
+                });
+            }
+            await page.waitForTimeout(API_REQUEST_DELAY_MS);
+        }
+
+        for (const file of files.values()) {
+            if (file.downloadUrl) continue;
+            const res = await this.skoolApi(page, 'POST', `https://api2.skool.com/files/${file.file_id}/download-url?expire=28800`);
+            if (res.ok && res.text.trim().startsWith('http')) file.downloadUrl = res.text.trim();
+            else this.logger.warn(`    ⚠️ No download link for "${file.title}" in post ${postUrl}: HTTP ${res.status}`);
+            await page.waitForTimeout(API_REQUEST_DELAY_MS);
+        }
+        return files;
+    }
+
+    // Signs each video the way Skool's player does for one it only knows by id
+    // (POST /videos/{id}/request-data). Skipped when videos are not downloaded.
+    private async resolvePostVideos(
+        page: Page,
+        ids: string[],
+        known: Map<string, PostVideo>,
+        resolve: boolean
+    ): Promise<PostVideo[]> {
+        const videos: PostVideo[] = [];
+        for (const id of ids) {
+            const video = known.get(id) ?? { id };
+            if (!video.streamUrl && resolve) {
+                const res = await this.skoolApi(page, 'POST', `https://api2.skool.com/videos/${id}/request-data`);
+                try {
+                    const data = res.ok ? JSON.parse(res.text) : null;
+                    if (data?.playback_id && data?.playback_token) {
+                        video.streamUrl = muxStreamUrl(data.playback_id, data.playback_token);
+                        video.durationMs = Number(data.duration) || video.durationMs;
+                    } else {
+                        this.logger.warn(`    ⚠️ No playback data for post video ${id}: HTTP ${res.status}`);
+                    }
+                } catch (err) {
+                    this.logger.warn(`    ⚠️ Unreadable playback data for post video ${id}: ${String(err)}`);
+                }
+                await page.waitForTimeout(API_REQUEST_DELAY_MS);
+            }
+            videos.push(video);
+        }
+        return videos;
     }
 
     private parsePostAttachments(attachmentsData: unknown, postUrl: string): Resource[] {

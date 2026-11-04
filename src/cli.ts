@@ -29,10 +29,11 @@ type CliArgs = {
     rollback?: boolean;
     port?: number;
     host?: string;
+    skipVideos?: boolean;
 };
 
 function showHelp() {
-    console.log(`\nSkool Downloader\n\nUsage:\n  skool                          Interactive mode\n  skool login                    Log in to Skool\n  skool <classroom-url>          Download a course\n  skool <group-classroom-url>    Download all courses in a community\n  skool <lesson-url>             Download a single lesson (URL with ?md=)\n  skool regenerate-index         Regenerate all course indexes\n  skool update                   Update the yt-dlp binary to the latest release\n  skool serve [port]             Start local web server with real-time progress sync\n\nOptions:\n  -o, --output <dir>             Output directory (course root)\n  -c, --concurrency <number>     Lesson concurrency (default: 8)\n  -p, --port <number>            Port for local web server (default: 3100)\n  --host <address>               Address the server listens on (default: 127.0.0.1; 0.0.0.0 opens it to your network)\n  --course                       Force course mode (ignore ?md=)\n  --lesson                       Force lesson mode\n  --lesson-id <id>               Explicit lesson id\n  --rollback                     With 'update', restore the previous yt-dlp\n  -h, --help                     Show help\n\nEnvironment:\n  SKOOL_DOWNLOADER_CACHE_DIR     Where the yt-dlp binary is kept\n  SKOOL_NO_YTDLP_UPDATE=1        Never check for a newer yt-dlp automatically\n`);
+    console.log(`\nSkool Downloader\n\nUsage:\n  skool                          Interactive mode\n  skool login                    Log in to Skool\n  skool <classroom-url>          Download a course\n  skool <group-classroom-url>    Download all courses in a community\n  skool <lesson-url>             Download a single lesson (URL with ?md=)\n  skool regenerate-index         Regenerate all course indexes\n  skool update                   Update the yt-dlp binary to the latest release\n  skool serve [port]             Start local web server with real-time progress sync\n\nOptions:\n  -o, --output <dir>             Output directory (course root)\n  -c, --concurrency <number>     Lesson concurrency (default: 8)\n  -p, --port <number>            Port for local web server (default: 3100)\n  --host <address>               Address the server listens on (default: 127.0.0.1; 0.0.0.0 opens it to your network)\n  --course                       Force course mode (ignore ?md=)\n  --lesson                       Force lesson mode\n  --lesson-id <id>               Explicit lesson id\n  --no-videos                    Save lessons without downloading their videos\n  --rollback                     With 'update', restore the previous yt-dlp\n  -h, --help                     Show help\n\nEnvironment:\n  SKOOL_DOWNLOADER_CACHE_DIR     Where the yt-dlp binary is kept\n  SKOOL_NO_YTDLP_UPDATE=1        Never check for a newer yt-dlp automatically\n`);
 }
 
 function parseArgs(args: string[]): CliArgs {
@@ -77,6 +78,10 @@ function parseArgs(args: string[]): CliArgs {
                 parsed.port = Number.parseInt(next, 10);
                 i++;
             }
+            continue;
+        }
+        if (arg === '--no-videos' || arg === '--skip-videos') {
+            parsed.skipVideos = true;
             continue;
         }
         if (arg === '--rollback') {
@@ -570,7 +575,14 @@ async function runInteractive() {
         return;
     }
 
-    if (!await ensureFfmpeg()) {
+    const downloadVideos = await confirm({
+        message: 'Download videos?',
+        initialValue: true
+    });
+    handleCancel(downloadVideos);
+    const skipVideos = !downloadVideos;
+
+    if (!skipVideos && !await ensureFfmpeg()) {
         outro('ffmpeg is required for video downloads. Exiting.');
         return;
     }
@@ -676,6 +688,7 @@ async function runInteractive() {
                     outputDir: outputRoot ? resolveCourseOutputDir(outputRoot, library.groupName, course.title) : undefined,
                     concurrency,
                     mode: 'course',
+                    skipVideos,
                     logger: interactiveLogger,
                     suppressIndexLogs: true,
                     runTasks,
@@ -731,6 +744,7 @@ async function runInteractive() {
         concurrency: actionValue === 'download-lesson' ? 1 : concurrency,
         mode: actionValue === 'download-lesson' ? 'lesson' : 'course',
         lessonId,
+        skipVideos,
         logger: interactiveLogger,
         suppressIndexLogs: true,
         runTasks,
@@ -914,7 +928,7 @@ async function runWithArgs(args: CliArgs) {
             console.log('Login required. Exiting.');
             return;
         }
-        if (!await ensureFfmpeg()) {
+        if (!args.skipVideos && !await ensureFfmpeg()) {
             process.exitCode = 1;
             return;
         }
@@ -941,7 +955,8 @@ async function runWithArgs(args: CliArgs) {
                         url: course.url,
                         outputDir: outputRoot ? resolveCourseOutputDir(outputRoot, library.groupName, course.title) : undefined,
                         concurrency: args.concurrency,
-                        mode: 'course'
+                        mode: 'course',
+                        skipVideos: args.skipVideos
                     });
                     totalFailures += summary.failures.length;
                 } catch (err) {
@@ -962,7 +977,8 @@ async function runWithArgs(args: CliArgs) {
             outputDir: args.outputDir,
             concurrency: args.concurrency,
             mode: args.mode,
-            lessonId: args.lessonId
+            lessonId: args.lessonId,
+            skipVideos: args.skipVideos
         });
         return;
     }
