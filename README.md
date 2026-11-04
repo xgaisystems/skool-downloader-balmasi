@@ -15,7 +15,7 @@ This tool downloads video content, localizes images, preserves course attachment
 - **♻️ Self-Updating `yt-dlp`:** Checks once a day for a newer `yt-dlp` and installs it before downloading, so video sites that change how they serve media keep working. The previous copy is kept for a one-command rollback.
 - **🧯 Video Merge Fallback:** If `ffmpeg` crashes while merging a video's streams, the download is retried with another `ffmpeg` and then with a single-file format that needs no merge.
 - **📋 Failure Report:** Lessons and videos that fail are listed at the end of the run and saved to `.download-failures.json` in the course folder. Rerunning the same command retries exactly those.
-- **📌 Community Posts:** Posts pinned to a lesson are saved with the lesson, attachments included.
+- **📌 Community Posts:** Posts pinned to a lesson are saved with the lesson: the post, every comment and reply in one `post.html`, and the files and videos of the post and of its comments.
 - **✅ Progress Tracking:** Mark lessons as done in the offline pages, with progress per course and per community, synced live across tabs and devices through a small local server (`skool serve`).
 
 ## 🛠 Prerequisites
@@ -100,6 +100,14 @@ Then choose **Download multiple courses** and select the courses you want. Cours
 
 You can also run `npx skool-downloader` to enter the same interactive menu.
 
+To save lessons **without their videos** (text, images, attachments and posts only), add `--no-videos`, or answer *no* to **Download videos?** in the interactive menu:
+
+```bash
+npm run skool https://www.skool.com/your-community/classroom -- --no-videos
+```
+
+Each lesson's `lesson.json` then records `videoSkipped` and `videoSource` (the video link, or `skool:<id>` for videos hosted on Skool) so a video can be matched to its lesson later. A `video.mp4` already in a lesson folder is kept and shown on the page.
+
 To download only a **single lesson**:
 
 ```bash
@@ -123,7 +131,10 @@ downloads/
             │   ├── video.mp4
             │   ├── assets/ (Localized images)
             │   ├── resources/ (Attachments)
-            │   └── posts/ (Attachments of the community posts pinned to the lesson)
+            │   └── posts/<post-slug>/ (A community post pinned to the lesson)
+            │       ├── post.html (The post and all its comments, one self-contained file)
+            │       ├── video-01.mp4, comentario-03-video-01.mp4 (Videos of the post and its comments)
+            │       └── … (Files attached to the post and its comments)
             └── ...
 ```
 
