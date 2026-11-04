@@ -84,6 +84,8 @@ export interface ClassroomResult {
     groupName: string;
     courseName: string;
     courseImageUrl?: string;
+    // Where the course sits in the community's classroom, from 0.
+    coursePosition?: number;
     modules: Module[];
 }
 
@@ -258,6 +260,14 @@ export class Scraper {
                 foundCourse?.metadata?.coverSmallUrl;
         }
 
+        // allCourses lists every course of the community in the order the
+        // classroom shows them.
+        const allCourses: any[] = pageProps.allCourses || pageProps.renderData?.allCourses || [];
+        const courseHandle = cleanUrl.split('/').filter(Boolean).pop();
+        const courseId = courseData.course?.id || courseData.id;
+        const positionIndex = allCourses.findIndex((c: any) => c?.name === courseHandle || (courseId && c?.id === courseId));
+        const coursePosition = positionIndex >= 0 ? positionIndex : undefined;
+
         this.logger.info(`🎓 Course detected: ${courseName}`);
 
         // Skool Hierarchy:
@@ -314,6 +324,7 @@ export class Scraper {
             groupName,
             courseName,
             courseImageUrl,
+            coursePosition,
             modules: modules.filter(m => m.lessons.length > 0)
         };
     }
