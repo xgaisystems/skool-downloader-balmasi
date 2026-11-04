@@ -1,6 +1,8 @@
-import { Scraper, Module, type LinkedPost } from './scraper.js';
+import { Scraper, Module } from './scraper.js';
 import { Downloader, summarizeVideoError } from './downloader.js';
-import { LINKED_POSTS_CSS, renderLinkedPosts, type LinkedPostFile } from './linked-posts.js';
+import { LINKED_POSTS_CSS, renderLinkedPosts, renderLinkedPostSource, type PostLinkResolver } from './linked-posts.js';
+import { saveLinkedPost, type LinkedPostManifest, type SavedLinkedPost } from './linked-post-archive.js';
+import { sanitizeName } from './utils.js';
 import { renderLessonProgressScript } from './progress-sync.js';
 import { regenerateIndex } from './regenerate-index.js';
 import { regenerateGroupIndex } from './regenerate-group-index.js';
@@ -83,6 +85,7 @@ type LessonManifest = {
     videoSkipped?: boolean;
     videoSource?: string;
     resourcesCount: number;
+    linkedPosts?: LinkedPostManifest[];
     updatedAt: string;
 };
 
@@ -186,37 +189,26 @@ function getUrlExtension(url: string) {
     return '.jpg';
 }
 
-function sanitizeName(value: string) {
-    // Windows drops trailing dots and spaces from folder names, so "Title..." would not resolve.
-    return value.replace(/[/\\?%*:|"<>]/g, '-').replace(/[. ]+$/, '');
-}
 
-// Stored per post because members commonly upload files with the same name
-// (image.png, resumen.pdf). A failed download keeps the remote link instead.
-async function saveLinkedPostFiles(
-    post: LinkedPost,
-    lessonDir: string,
-    downloader: Downloader,
-    logger: Logger
-): Promise<LinkedPostFile[]> {
-    const postDirName = sanitizeName(post.name);
-    const usedNames = new Set<string>();
-
-    return Promise.all(post.attachments.map(async (attachment) => {
-        const name = attachment.file_name || attachment.title;
-        let fileName = sanitizeName(name) || attachment.file_id || 'attachment';
-        if (usedNames.has(fileName)) fileName = `${attachment.file_id}-${fileName}`;
-        usedNames.add(fileName);
-
-        const isImage = !!attachment.file_content_type?.startsWith('image/');
-        try {
-            await downloader.downloadAsset(attachment.downloadUrl!, path.join(lessonDir, 'posts', postDirName, fileName));
-            return { name, isImage, href: `posts/${encodeURIComponent(postDirName)}/${encodeURIComponent(fileName)}` };
-        } catch (err) {
-            logger.warn(`    ⚠️  Failed to download attachment "${name}" of post ${post.url}: ${String(err)}`);
-            return { name, isImage, href: attachment.downloadUrl! };
+// Posts link to lessons as obj://course/<lesson id>?cn=<course key>. A lesson
+// of this course that is saved, or being saved in this run, gets a relative
+// link from `fromDir`; any other one links to Skool.
+function createLessonLinkResolver(
+    lessonDirs: Map<string, string>,
+    willSave: Set<string>,
+    groupUrl: string
+): (fromDir: string) => PostLinkResolver {
+    return (fromDir) => (href) => {
+        const match = href.match(/^obj:\/\/course\/([0-9a-f]+)(?:\?(.*))?$/i);
+        if (!match) return undefined;
+        const lessonId = match[1]!;
+        const lessonDir = lessonDirs.get(lessonId);
+        if (lessonDir && (willSave.has(lessonId) || fs.existsSync(path.join(lessonDir, 'index.html')))) {
+            return path.relative(fromDir, path.join(lessonDir, 'index.html')).split(path.sep).map(encodeURIComponent).join('/');
         }
-    }));
+        const courseKey = new URLSearchParams(match[2] ?? '').get('cn');
+        return courseKey ? `${groupUrl}/classroom/${encodeURIComponent(courseKey)}?md=${lessonId}` : undefined;
+    };
 }
 
 function resolveTargetLessonId(
@@ -302,6 +294,16 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
 
         if (modules.length === 0) {
             throw new Error('No modules found. Are you sure this is a classroom URL and you are logged in?');
+        }
+
+        // Folder of every lesson of the course, relative to the course folder,
+        // taken before single-lesson mode drops the others.
+        const lessonRelativeDirs = new Map<string, string>();
+        for (const m of modules) {
+            const moduleDirName = m.root ? '' : `${m.index}-${sanitizeName(m.title)}`;
+            for (const l of m.lessons) {
+                lessonRelativeDirs.set(l.id, path.join(moduleDirName, `${l.index ?? 1}-${sanitizeName(l.title)}`));
+            }
         }
 
         if (targetLessonId) {
@@ -438,6 +440,14 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
 
         await writeAtomicJson(path.join(baseOutputDir, '.course.json'), courseManifest);
 
+        const classroomPath = new URL(classroomUrl);
+        const groupUrl = `${classroomPath.origin}/${classroomPath.pathname.split('/').filter(Boolean)[0]}`;
+        const linkResolver = createLessonLinkResolver(
+            new Map([...lessonRelativeDirs].map(([id, dir]) => [id, path.join(baseOutputDir, dir)])),
+            new Set(modules.flatMap(m => m.lessons.map(l => l.id))),
+            groupUrl
+        );
+
         const tasks: LessonTask[] = [];
 
         for (let i = 0; i < modules.length; i++) {
@@ -545,13 +555,34 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                 results.forEach(r => { if (r) resourcesHtml.push(r); });
                             }
 
-                            updateStatus('Saving community posts...');
-                            const linkedPostViews = await Promise.all((lessonData.linkedPosts ?? []).map(async (post) => ({
-                                ...post,
-                                contentHtml: await downloader.localizeImages(post.contentHtml, lessonDir),
-                                files: await saveLinkedPostFiles(post, lessonDir, downloader, logger)
-                            })));
-                            const linkedPostsHtml = renderLinkedPosts(linkedPostViews);
+                            const savedPosts: SavedLinkedPost[] = [];
+                            for (const post of lessonData.linkedPosts ?? []) {
+                                updateStatus(`Saving community post ${savedPosts.length + 1}/${lessonData.linkedPosts!.length}...`);
+                                const saved = await saveLinkedPost(post, {
+                                    lessonDir,
+                                    lessonTitle: lessonData.title,
+                                    downloader,
+                                    logger,
+                                    skipVideos: Boolean(options.skipVideos),
+                                    linkResolver
+                                });
+                                for (const failure of saved.videoFailures) {
+                                    failures.push({
+                                        lessonTitle: taskTitle,
+                                        lessonUrl: lesson.url,
+                                        lessonDir,
+                                        kind: 'video',
+                                        reason: `Video of community post ${post.url}: ${failure.reason}`,
+                                        videoUrl: failure.videoUrl
+                                    });
+                                }
+                                if (saved.videoFailures.length > 0 && !taskError) {
+                                    taskError = new Error(`${saved.videoFailures.length} video(s) of community post ${post.url} failed`);
+                                }
+                                savedPosts.push(saved);
+                            }
+                            const linkedPostsHtml = renderLinkedPosts(savedPosts.map(p => p.view));
+                            const sourcesHtml = savedPosts.map(p => renderLinkedPostSource(p.view));
 
                             const isRootLesson = mInfo.moduleDirName.length === 0;
                             const groupLink = isRootLesson ? '../../index.html' : '../../../index.html';
@@ -799,11 +830,11 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                         <div class="content">
                                             ${localizedHtml}
                                         </div>
-                                        ${resourcesHtml.length > 0 ? `
+                                        ${resourcesHtml.length + sourcesHtml.length > 0 ? `
                                         <div class="resources">
                                             <h3>Resources / Attachments</h3>
                                             <ul>
-                                                ${resourcesHtml.join('')}
+                                                ${resourcesHtml.join('')}${sourcesHtml.join('')}
                                             </ul>
                                         </div>
                                         ` : ''}
@@ -836,6 +867,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                 videoError,
                                 ...(videoSkipped ? { videoSkipped, videoSource } : {}),
                                 resourcesCount: resourcesHtml.length,
+                                ...(savedPosts.length > 0 ? { linkedPosts: savedPosts.map(p => p.manifest) } : {}),
                                 updatedAt: new Date().toISOString()
                             };
 

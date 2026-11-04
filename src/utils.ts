@@ -2,6 +2,11 @@
  * Date and time formatting utilities adhering to the European standard (dd/mm/aaaa).
  */
 
+export function sanitizeName(value: string) {
+    // Windows drops trailing dots and spaces from folder names, so "Title..." would not resolve.
+    return value.replace(/[/\\?%*:|"<>]/g, '-').replace(/[. ]+$/, '');
+}
+
 export function escapeHtml(text: string): string {
     return text
         .replace(/&/g, '&amp;')
