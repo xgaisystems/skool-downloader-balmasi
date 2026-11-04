@@ -100,6 +100,14 @@ Then choose **Download multiple courses** and select the courses you want. Cours
 
 You can also run `npx skool-downloader` to enter the same interactive menu.
 
+To save lessons **without their videos** (text, images, attachments and posts only), add `--no-videos`, or answer *no* to **Download videos?** in the interactive menu:
+
+```bash
+npm run skool https://www.skool.com/your-community/classroom -- --no-videos
+```
+
+Each lesson's `lesson.json` then records `videoSkipped` and `videoSource` (the video link, or `skool:<id>` for videos hosted on Skool) so a video can be matched to its lesson later. A `video.mp4` already in a lesson folder is kept and shown on the page.
+
 To download only a **single lesson**:
 
 ```bash

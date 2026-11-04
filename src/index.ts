@@ -78,6 +78,10 @@ type LessonManifest = {
     relativePath: string;
     hasVideo: boolean;
     videoError?: string;
+    // Set when the run skipped videos: where the lesson's video comes from (its
+    // link, or `skool:<id>` for Skool-hosted videos), to match one added later.
+    videoSkipped?: boolean;
+    videoSource?: string;
     resourcesCount: number;
     updatedAt: string;
 };
@@ -133,6 +137,9 @@ export type DownloadOptions = {
     logger?: Logger;
     callbacks?: DownloadCallbacks;
     suppressIndexLogs?: boolean;
+    // Save lessons without downloading their videos. A video.mp4 already in the
+    // lesson folder is kept and still shown on the page.
+    skipVideos?: boolean;
     runTasks?: (tasks: LessonTask[], concurrency: number) => Promise<void>;
 };
 
@@ -468,14 +475,18 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                         try {
                             updateStatus('Loading lesson data...');
                             await fs.ensureDir(lessonDir);
-                            const lessonData = await scraper.extractLessonData(lesson.url);
+                            const lessonData = await scraper.extractLessonData(lesson.url, { resolveNativeVideo: !options.skipVideos });
 
                             updateStatus('Localizing images...');
                             const localizedHtml = await downloader.localizeImages(lessonData.contentHtml || '', lessonDir);
 
                             let hasVideo = false;
                             let videoError: string | undefined;
-                            if (lessonData.videoLink) {
+                            const videoSource = lessonData.videoLink || (lessonData.videoId ? `skool:${lessonData.videoId}` : undefined);
+                            const videoSkipped = Boolean(options.skipVideos && videoSource);
+                            if (options.skipVideos) {
+                                hasVideo = await fs.pathExists(path.join(lessonDir, 'video.mp4'));
+                            } else if (lessonData.videoLink) {
                                 try {
                                     updateStatus('Downloading video...');
                                     await downloader.downloadVideo(lessonData.videoLink, lessonDir, 'video');
@@ -823,6 +834,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                     : `${lessonDirName}/index.html`,
                                 hasVideo,
                                 videoError,
+                                ...(videoSkipped ? { videoSkipped, videoSource } : {}),
                                 resourcesCount: resourcesHtml.length,
                                 updatedAt: new Date().toISOString()
                             };

@@ -35,6 +35,8 @@ export interface Lesson {
     index?: number;
     contentHtml?: string;
     videoLink?: string;
+    // Skool's own (Mux) video id, for lessons whose video is hosted on Skool.
+    videoId?: string;
     resources?: Resource[];
     linkedPosts?: LinkedPost[];
 }
@@ -331,7 +333,9 @@ export class Scraper {
         };
     }
 
-    async extractLessonData(url: string): Promise<Lesson> {
+    // resolveNativeVideo: false skips the play click that signs a native video's
+    // stream URL, for runs that do not download videos.
+    async extractLessonData(url: string, { resolveNativeVideo = true }: { resolveNativeVideo?: boolean } = {}): Promise<Lesson> {
         if (!this.context) await this.init();
         const page = await this.context!.newPage();
 
@@ -378,7 +382,7 @@ export class Scraper {
         let vLink = metadata.videoLink || foundLesson?.video?.url || '';
 
         // Native Skool Player Handling (Mux)
-        if (!vLink && metadata.videoId) {
+        if (!vLink && metadata.videoId && resolveNativeVideo) {
             this.logger.info(`    ℹ️ Native videoId found: ${metadata.videoId}.`);
 
             try {
@@ -570,6 +574,7 @@ export class Scraper {
             url: url,
             contentHtml: body,
             videoLink: vLink,
+            videoId: metadata.videoId || undefined,
             resources: resources,
             linkedPosts
         };
