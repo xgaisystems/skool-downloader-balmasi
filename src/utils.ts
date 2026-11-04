@@ -1,6 +1,51 @@
+import fs from 'fs';
+import path from 'path';
+
 /**
  * Date and time formatting utilities adhering to the European standard (dd/mm/aaaa).
  */
+
+let resolvedDownloadsDir: string | null = null;
+
+// Where communities are downloaded and served from: SKOOL_DOWNLOADS_DIR, or
+// downloads/ under the current directory. A configured folder that cannot be
+// used (an unmounted share, no permission) falls back to the default with a
+// warning instead of failing. Worked out once per run, so the warning shows
+// once and every course of the run lands in the same place.
+export function resolveDownloadsDir(): string {
+    if (resolvedDownloadsDir) return resolvedDownloadsDir;
+    const fallback = path.resolve(process.cwd(), 'downloads');
+    let dir = fallback;
+    const override = process.env.SKOOL_DOWNLOADS_DIR?.trim();
+    if (override) {
+        const wanted = path.resolve(override);
+        const problem = downloadsDirProblem(wanted);
+        if (problem) {
+            console.warn(`⚠️  SKOOL_DOWNLOADS_DIR ${wanted} ${problem}. Using ${fallback} instead.`);
+        } else {
+            dir = wanted;
+        }
+    }
+    resolvedDownloadsDir = dir;
+    return dir;
+}
+
+// Only the last folder is created. Its parent must exist: creating the whole
+// path under an unmounted mount point would write to the wrong disk.
+function downloadsDirProblem(dir: string): string | null {
+    try {
+        if (!fs.existsSync(dir)) {
+            const parent = path.dirname(dir);
+            if (!fs.existsSync(parent)) return `is not available (${parent} does not exist)`;
+            fs.mkdirSync(dir);
+        }
+        if (!fs.statSync(dir).isDirectory()) return 'is not a folder';
+        fs.accessSync(dir, fs.constants.W_OK);
+        return null;
+    } catch (err) {
+        return `is not available (${(err as NodeJS.ErrnoException).code ?? String(err)})`;
+    }
+}
 
 export function sanitizeName(value: string) {
     // Windows drops trailing dots and spaces from folder names, so "Title..." would not resolve.

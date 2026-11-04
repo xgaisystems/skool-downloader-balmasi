@@ -116,7 +116,13 @@ npm run skool "https://www.skool.com/your-community/classroom/course-id?md=lesso
 
 ## 📁 Output Structure
 
-The tool creates a `downloads/` folder with the following structure:
+The tool creates a `downloads/` folder in the directory you run it from. To keep downloads somewhere else, set `SKOOL_DOWNLOADS_DIR`, either in the environment or in a `.env` file next to `package.json` (it is not committed):
+
+```bash
+SKOOL_DOWNLOADS_DIR=/path/to/downloads
+```
+
+Downloading, `skool serve` and index regeneration all use that folder. If it cannot be used (for example a network or shared folder that is not mounted, or no write permission), the tool warns and uses `downloads/` instead. Only the last folder of the path is created when missing, never its parents, so an unmounted share is not silently replaced by a local folder. Its structure:
 ```text
 downloads/
 └── Community Name/

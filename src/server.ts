@@ -1,7 +1,7 @@
 import http, { type IncomingMessage, type ServerResponse } from 'http';
 import fs from 'fs';
 import path from 'path';
-import { escapeHtml } from './utils.js';
+import { escapeHtml, resolveDownloadsDir } from './utils.js';
 import { PROGRESS_SERVER_PORT } from './progress-sync.js';
 
 export interface ServerOptions {
@@ -58,7 +58,7 @@ function renderCommunityList(rootDir: string): string {
 export function startServer(options: ServerOptions = {}) {
     const defaultPort = options.port || PROGRESS_SERVER_PORT;
     const host = options.host || '127.0.0.1';
-    const rootDir = path.resolve(options.rootDir || path.join(process.cwd(), 'downloads'));
+    const rootDir = path.resolve(options.rootDir || resolveDownloadsDir());
     const progressFilePath = path.join(rootDir, 'progress.json');
 
     // Active SSE client connections
