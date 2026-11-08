@@ -2,6 +2,10 @@ import fs from 'fs-extra';
 import path from 'path';
 import { formatDate, resolveDownloadsDir } from './utils.js';
 import { renderLessonProgressScript, renderProgressScript } from './progress-sync.js';
+import { Downloader } from './downloader.js';
+import { findLessonVideo, readTracksManifest, tracksSummary } from './media-tracks.js';
+import { renderVideoPlayer, replaceVideoPlayer } from './video-player.js';
+import { createConsoleLogger } from './logger.js';
 
 type CourseManifest = {
     courseName: string;
@@ -49,11 +53,46 @@ type RegenerateOptions = {
     patchLessons?: boolean;
 };
 
-async function patchLessonHtml(indexPath: string, lessonId: string) {
+/**
+ * For a lesson with a video (`video.mp4`, or one put there by hand under its
+ * own name, `findLessonVideo()`): takes out its audio tracks and
+ * subtitles (`prepareTracks()`, which also lists files added since) and
+ * rebuilds the page's player from them, and records the video in
+ * `lesson.json`. This is how a video put in the folder by hand, or subtitles
+ * improved later, reach the page without visiting Skool.
+ */
+async function refreshVideoPlayer(lessonDir: string, html: string, downloader: Downloader): Promise<string> {
+    const videoName = await findLessonVideo(lessonDir);
+    if (videoName === null) return html;
+    await downloader.prepareTracks(lessonDir, videoName);
+
+    const manifestPath = path.join(lessonDir, 'lesson.json');
+    try {
+        const manifest = await fs.readJson(manifestPath);
+        const media = tracksSummary(await readTracksManifest(lessonDir, videoName));
+        const updated = {
+            ...manifest,
+            hasVideo: true,
+            ...(videoName !== 'video' ? { videoFile: `${videoName}.mp4` } : {}),
+            ...(media ? { media } : {})
+        };
+        if (JSON.stringify(updated) !== JSON.stringify(manifest)) await fs.writeJson(manifestPath, updated, { spaces: 2 });
+    } catch {
+        // No lesson.json: the course index falls back to the folder names.
+    }
+
+    const player = await renderVideoPlayer(lessonDir, videoName);
+    const replaced = replaceVideoPlayer(html, player, `${videoName}.mp4`);
+    if (replaced !== null) return replaced;
+    // A page saved without a video: the player goes under the title.
+    return html.replace(/(<h1>[\s\S]*?<\/h1>)/, (h1: string) => `${h1}\n${player}`);
+}
+
+async function patchLessonHtml(indexPath: string, lessonId: string, downloader: Downloader) {
     if (!await fs.pathExists(indexPath)) return;
     try {
         const original = await fs.readFile(indexPath, 'utf-8');
-        let html = original;
+        let html = await refreshVideoPlayer(path.dirname(indexPath), original, downloader);
 
         const buttonHtml = `<button type="button" class="lesson-title-tick" id="lessonTickBtn" data-lesson-id="${lessonId}" title="Marcar como realizada" aria-label="Marcar como realizada"><svg viewBox="0 0 20 20" fill="none"><path d="M4.5 10.5L8 14L15.5 5.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>`;
 
@@ -156,8 +195,12 @@ async function patchLessonHtml(indexPath: string, lessonId: string) {
         }
 
         const script = renderLessonProgressScript();
-        if (/<script>[\s\S]*?STORAGE_KEY\s*=\s*'cerebro_completed_lessons'[\s\S]*?<\/script>/.test(html)) {
-            html = html.replace(/<script>[\s\S]*?STORAGE_KEY\s*=\s*'cerebro_completed_lessons'[\s\S]*?<\/script>/, script.trim());
+        // Within one script element: a lazy `[\s\S]*?` from the first
+        // `<script>` ran on through any script before this one (the video
+        // player's) and deleted it.
+        const progressScript = /<script>(?:(?!<\/script>)[\s\S])*?STORAGE_KEY\s*=\s*'cerebro_completed_lessons'[\s\S]*?<\/script>/;
+        if (progressScript.test(html)) {
+            html = html.replace(progressScript, () => script.trim());
         } else if (html.includes('</body>')) {
             html = html.replace('</body>', `${script}\n                            </body>`);
         }
@@ -176,6 +219,8 @@ async function regenerateIndex(
 ) {
     const log = options.silent ? () => {} : console.log;
     const warn = options.silent ? () => {} : console.warn;
+    // Only used for lessons with a video, when lesson pages are patched.
+    const downloader = new Downloader(createConsoleLogger({ silent: options.silent }));
 
     if (!fs.existsSync(downloadsDir)) {
         log(`❌ Downloads directory not found: ${downloadsDir}`);
@@ -277,7 +322,7 @@ async function regenerateIndex(
                 });
 
                 if (options.patchLessons !== false) {
-                    await patchLessonHtml(indexPath, `${courseDirName}/${relativePath.replace(/\\/g, '/')}`);
+                    await patchLessonHtml(indexPath, `${courseDirName}/${relativePath.replace(/\\/g, '/')}`, downloader);
                 }
             }
         }
@@ -338,7 +383,7 @@ async function regenerateIndex(
                 });
 
                 if (options.patchLessons !== false) {
-                    await patchLessonHtml(indexPath, `${courseDirName}/${relativePath.replace(/\\/g, '/')}`);
+                    await patchLessonHtml(indexPath, `${courseDirName}/${relativePath.replace(/\\/g, '/')}`, downloader);
                 }
             }
         }

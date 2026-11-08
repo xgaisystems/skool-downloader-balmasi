@@ -12,8 +12,14 @@ import { createRequire } from 'module';
 import { promisify } from 'util';
 import { createConsoleLogger, type Logger } from './logger.js';
 import { COOKIES_TXT_PATH } from './auth.js';
+import { ISO_639_2, isSubtitleFailure, isYouTubeUrl, planYouTubeDownload, youtubeRuntimeArgs, type YouTubeInfo, type YouTubePlan } from './youtube.js';
+import { baseLanguage, readTracksManifest, updateTracksManifest, type TrackFacts } from './media-tracks.js';
 
 const execFileAsync = promisify(execFile);
+
+// Pauses before fetching a YouTube subtitle on its own: the first one before
+// every request, the rest between retries after a 429.
+const SUBTITLE_RETRY_DELAYS_MS = [5_000, 30_000, 90_000];
 
 const YTDlpWrap = (YTDlpWrapPkg as any).default || YTDlpWrapPkg;
 
@@ -730,6 +736,7 @@ export class Downloader {
             const stats = fs.statSync(outputPath);
             if (stats.size > 0) {
                 this.logger.info(`    ⏭️  Video already exists, skipping download (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
+                await this.prepareTracks(outputDir, filename, await this.factsForSavedVideo(url, outputDir, filename));
                 return;
             }
         }
@@ -758,8 +765,48 @@ export class Downloader {
         }
 
         let lastError: unknown = null;
+        // Subtitles that still have to be fetched once the video is saved.
+        let pendingSubtitles: { plan: YouTubePlan; keys: string[] } | null = null;
+        // Where the tracks come from, when the host says (YouTube).
+        let facts: TrackFacts | undefined;
+        if (isYouTubeUrl(url)) {
+            baseArgs.push(...youtubeRuntimeArgs());
+            const plan = await this.planYouTube(url, baseArgs.slice(1));
+            facts = plan ? { ...plan.facts, source: url } : undefined;
+            if (plan && (plan.formatArgs.length > 0 || plan.subtitleArgs.length > 0)) {
+                try {
+                    await this.runVideoAttempts([...baseArgs, ...plan.formatArgs, ...plan.subtitleArgs], outputDir, filename);
+                    await this.prepareTracks(outputDir, filename, facts);
+                    return;
+                } catch (error) {
+                    lastError = error;
+                }
+                pendingSubtitles = plan.subtitleKeys.length > 0 ? { plan, keys: plan.subtitleKeys } : null;
+
+                // YouTube answers bursts of subtitle requests with 429, which
+                // fails the whole download. Keep the audio tracks and fetch
+                // the subtitles on their own afterwards, with pauses.
+                if (isSubtitleFailure(lastError) && plan.formatArgs.length > 0) {
+                    this.logger.warn(`    ⚠️ Subtitles failed (${summarizeVideoError(lastError)}), downloading the video without them; they are fetched afterwards`);
+                    try {
+                        await this.runVideoAttempts([...baseArgs, ...plan.formatArgs], outputDir, filename);
+                        await this.fetchSubtitlesLater(url, baseArgs.slice(1), outputDir, filename, pendingSubtitles!);
+                        await this.prepareTracks(outputDir, filename, facts);
+                        return;
+                    } catch (error) {
+                        lastError = error;
+                    }
+                }
+                // Neither subtitles nor extra audio tracks are worth losing the
+                // video for: try again as any other video.
+                this.logger.warn(`    ⚠️ ${isSubtitleFailure(lastError) ? 'Subtitles' : 'Multi-language download'} failed (${summarizeVideoError(lastError)}), retrying with the default audio only`);
+            }
+        }
+
         try {
             await this.runVideoAttempts(baseArgs, outputDir, filename);
+            if (pendingSubtitles) await this.fetchSubtitlesLater(url, baseArgs.slice(1), outputDir, filename, pendingSubtitles);
+            if (facts) await this.prepareTracks(outputDir, filename, facts);
             return;
         } catch (error) {
             lastError = error;
@@ -787,6 +834,170 @@ export class Downloader {
             this.logger.error(VIMEO_BLOCK_HINT);
         }
         throw lastError;
+    }
+
+    /**
+     * Writes `<name>.tracks.json` (`src/media-tracks.ts`): what each audio
+     * track and subtitle is and where it came from. Browsers other than
+     * Safari play only the first audio track of an mp4, so every other one is
+     * also copied (not re-encoded) to `<name>.<lang>.m4a` for the lesson
+     * page's player. Also runs for a video that already exists, so one saved
+     * earlier gets its files; without `facts` an earlier manifest is kept.
+     * Text subtitles inside the video (Vimeo's, or from any other source)
+     * are extracted to `<name>.<lang>.vtt` when that language has no file
+     * yet, since browsers do not show them. A failure only costs the extra
+     * tracks and labels.
+     */
+    async prepareTracks(outputDir: string, filename: string, facts?: TrackFacts): Promise<void> {
+        const videoPath = path.join(outputDir, `${filename}.mp4`);
+        try {
+            // Also called when videos are skipped, before anything resolved
+            // ffmpeg.
+            if (this.ffmpegPaths.length === 0) this.ffmpegPaths = await resolveFfmpegPaths(this.logger);
+            const ffmpeg = this.ffmpegPaths[0]!;
+            // `ffmpeg -i` alone lists the streams and exits with an error, as
+            // it was given no output.
+            const probe = await execFileAsync(ffmpeg, ['-hide_banner', '-i', videoPath])
+                .then(r => r.stderr, (err: { stderr?: string }) => err.stderr ?? '');
+            const streams = (type: string) => [...probe.matchAll(new RegExp(`Stream #0:\\d+(?:\\[[^\\]]*\\])?(?:\\(([a-z]{2,3})\\))?: ${type}: (\\w+)`, 'g'))]
+                .map(m => ({ code: m[1], codec: m[2]! }));
+            const languages = streams('Audio').map(s => s.code);
+
+            const fromIso = Object.fromEntries(Object.entries(ISO_639_2).map(([two, three]) => [three, two]));
+            const used = new Set<string>();
+            const tracks = languages.map((code, i) => {
+                let lang = code && code !== 'und' ? (fromIso[code] ?? code) : 'und';
+                if (used.has(lang)) lang = `${lang}${i + 1}`;
+                used.add(lang);
+                return { lang, ...(i > 0 ? { file: `${filename}.${lang}.m4a` } : {}) };
+            });
+
+            for (const [i, track] of tracks.entries()) {
+                if (i === 0) continue;
+                const target = path.join(outputDir, track.file!);
+                if (await fs.pathExists(target)) continue;
+                const tmp = `${target}.tmp`;
+                try {
+                    // `-f mp4`: the m4a muxer only takes AAC and ALAC, and
+                    // YouTube's best audio is often Opus.
+                    await execFileAsync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-i', videoPath,
+                        '-map', `0:a:${i}`, '-c', 'copy', '-movflags', '+faststart', '-f', 'mp4', tmp]);
+                    await fs.move(tmp, target, { overwrite: true });
+                } finally {
+                    await fs.remove(tmp).catch(() => {});
+                }
+            }
+
+            // Only text formats convert to WebVTT; DVD/Blu-ray subtitles are
+            // pictures.
+            const extracted: string[] = [];
+            const textCodecs = new Set(['mov_text', 'subrip', 'srt', 'webvtt', 'ass', 'ssa', 'text']);
+            const existing = await fs.readdir(outputDir);
+            for (const [i, stream] of streams('Subtitle').entries()) {
+                if (!textCodecs.has(stream.codec)) continue;
+                const lang = stream.code && stream.code !== 'und' ? (fromIso[stream.code] ?? stream.code) : 'und';
+                const hasLanguage = existing.some(name => name.startsWith(`${filename}.`) && name.endsWith('.vtt') &&
+                    baseLanguage(name.slice(filename.length + 1, -'.vtt'.length)) === baseLanguage(lang));
+                if (hasLanguage) continue;
+                const file = `${filename}.${lang}.vtt`;
+                const tmp = path.join(outputDir, `${file}.tmp`);
+                try {
+                    await execFileAsync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-i', videoPath,
+                        '-map', `0:s:${i}`, '-c:s', 'webvtt', '-f', 'webvtt', tmp]);
+                    await fs.move(tmp, path.join(outputDir, file), { overwrite: true });
+                    existing.push(file);
+                    extracted.push(file);
+                } finally {
+                    await fs.remove(tmp).catch(() => {});
+                }
+            }
+
+            const manifest = await updateTracksManifest(outputDir, filename, tracks, facts, extracted);
+            if (manifest) {
+                const audio = manifest.audio.map(a => `${a.lang}${a.kind ? ` ${a.kind}${a.generated ? ' (auto)' : ''}` : ''}`);
+                const subs = manifest.subtitles.map(t => `${t.lang} ${t.origin}`);
+                this.logger.info(`    🎧 Tracks: audio ${audio.join(', ') || '-'}; subtitles ${subs.join(', ') || '-'}`);
+            }
+        } catch (error) {
+            this.logger.warn(`    ⚠️ Could not prepare the audio tracks and subtitles list: ${summarizeVideoError(error)}`);
+        }
+    }
+
+    /**
+     * A YouTube video saved before `<name>.tracks.json` recorded where its
+     * tracks come from: ask YouTube once (no download), so its subtitles are
+     * marked as transcription or translation rather than just automatic.
+     */
+    private async factsForSavedVideo(url: string, outputDir: string, filename: string): Promise<TrackFacts | undefined> {
+        if (!isYouTubeUrl(url)) return undefined;
+        const manifest = await readTracksManifest(outputDir, filename);
+        if (manifest?.source) return undefined;
+        const plan = await this.planYouTube(url, ['--no-check-certificates', ...youtubeRuntimeArgs()]);
+        return plan ? { ...plan.facts, source: url } : undefined;
+    }
+
+    /**
+     * Looks at a YouTube video's audio tracks and subtitles and returns the
+     * yt-dlp arguments that add those in the wanted languages
+     * (`youtubeLanguages()`). Empty when there is nothing to add or the probe
+     * fails, which only costs the extras.
+     */
+    private async planYouTube(url: string, commonArgs: string[]): Promise<YouTubePlan | null> {
+        const probeArgs = commonArgs.filter((_, i, all) => all[i] !== '-o' && all[i - 1] !== '-o');
+        let info: YouTubeInfo;
+        try {
+            const stdout: string = await this.ytDlp!.execPromise([url, '-J', '--no-playlist', ...probeArgs]);
+            info = JSON.parse(stdout) as YouTubeInfo;
+        } catch (error) {
+            this.logger.warn(`    ⚠️ Could not inspect the YouTube video's languages: ${summarizeVideoError(error)}`);
+            return null;
+        }
+
+        const plan = planYouTubeDownload(info);
+        const found = [
+            plan.audioLanguages.length >= 2 ? `audio ${plan.audioLanguages.join(' + ')}` : '',
+            plan.subtitleKeys.length > 0 ? `subtitles ${plan.subtitleKeys.join(', ')}` : ''
+        ].filter(Boolean);
+        if (found.length > 0) this.logger.info(`    🌐 YouTube: ${found.join(', ')}`);
+        return plan;
+    }
+
+    /**
+     * Fetches subtitles one language at a time, after the video, waiting out
+     * YouTube's 429s. They end up only as `<name>.<lang>.vtt` (not embedded),
+     * which is what the lesson page's player reads. Never fails the video.
+     */
+    private async fetchSubtitlesLater(
+        url: string,
+        commonArgs: string[],
+        outputDir: string,
+        filename: string,
+        pending: { plan: YouTubePlan; keys: string[] }
+    ): Promise<void> {
+        const args = commonArgs.filter((_, i, all) => all[i] !== '-o' && all[i - 1] !== '-o');
+        const waits = SUBTITLE_RETRY_DELAYS_MS;
+        for (const key of pending.keys) {
+            // `%(ext)s` rather than `.mp4`: yt-dlp names a subtitle after the
+            // video's name with its own extension replaced, and without a
+            // format chosen that extension is not mp4.
+            const output = path.join(outputDir, `${filename}.%(ext)s`);
+            for (const [attempt, wait] of waits.entries()) {
+                await new Promise(resolve => setTimeout(resolve, wait));
+                try {
+                    await this.ytDlp!.execPromise([url, '-o', output, ...args, ...pending.plan.singleSubtitleArgs(key),
+                        '--ffmpeg-location', this.ffmpegPaths[0]!]);
+                    this.logger.info(`    💬 Subtitles ${key} saved`);
+                    break;
+                } catch (error) {
+                    const last = attempt === waits.length - 1;
+                    if (last || !/429|Too Many Requests/.test(String(error))) {
+                        this.logger.warn(`    ⚠️ Subtitles ${key} not saved: ${summarizeVideoError(error)}`);
+                        break;
+                    }
+                    this.logger.info(`    ⏳ YouTube is rate limiting subtitles (429), retrying ${key} in ${Math.round(waits[attempt + 1]! / 1000)} s`);
+                }
+            }
+        }
     }
 
     /**
