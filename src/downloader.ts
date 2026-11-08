@@ -12,8 +12,14 @@ import { createRequire } from 'module';
 import { promisify } from 'util';
 import { createConsoleLogger, type Logger } from './logger.js';
 import { COOKIES_TXT_PATH } from './auth.js';
+import { ISO_639_2, isSubtitleFailure, isYouTubeUrl, planYouTubeDownload, youtubeRuntimeArgs, type YouTubeInfo, type YouTubePlan } from './youtube.js';
+import { baseLanguage, readTracksManifest, updateTracksManifest, type TrackFacts } from './media-tracks.js';
 
 const execFileAsync = promisify(execFile);
+
+// Pauses before fetching a YouTube subtitle on its own: the first one before
+// every request, the rest between retries after a 429.
+const SUBTITLE_RETRY_DELAYS_MS = [5_000, 30_000, 90_000];
 
 const YTDlpWrap = (YTDlpWrapPkg as any).default || YTDlpWrapPkg;
 
@@ -64,7 +70,7 @@ const STALE_AFTER_DAYS = 30;
 // this stamp file extends that across runs.
 const CHECK_EVERY_HOURS = 24;
 
-type VersionStamp = { lastCheckedAt?: string };
+type VersionStamp = { lastCheckedAt?: string; asset?: string };
 
 /**
  * Reads the version yt-dlp reports for itself.
@@ -101,13 +107,35 @@ function daysSince(date: Date): number {
     return Math.floor((Date.now() - date.getTime()) / (1000 * 60 * 60 * 24));
 }
 
-async function writeVersionStamp(): Promise<void> {
+async function readVersionStamp(): Promise<VersionStamp> {
     try {
-        const stamp: VersionStamp = { lastCheckedAt: new Date().toISOString() };
+        return ((await fs.readJson(VERSION_STAMP_PATH)) as VersionStamp) ?? {};
+    } catch {
+        return {};
+    }
+}
+
+/**
+ * `asset` is passed only when a binary was just put in place; otherwise the
+ * asset recorded by the last install is kept.
+ */
+async function writeVersionStamp(asset?: string): Promise<void> {
+    try {
+        const previous = await readVersionStamp();
+        const stamp: VersionStamp = {
+            lastCheckedAt: new Date().toISOString(),
+            asset: asset ?? previous.asset
+        };
         await fs.writeJson(VERSION_STAMP_PATH, stamp);
     } catch {
         // A stamp that cannot be written only costs one extra check next run.
     }
+}
+
+/** True when the installed binary is a different build than the one wanted. */
+async function needsAssetSwitch(): Promise<boolean> {
+    const stamp = await readVersionStamp();
+    return (stamp.asset ?? LEGACY_ASSET_NAME) !== ASSET_NAME;
 }
 
 async function checkedRecently(): Promise<boolean> {
@@ -149,7 +177,30 @@ async function fetchLatestVersion(): Promise<string> {
     return tag;
 }
 
-const ASSET_NAME = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+/**
+ * Which yt-dlp release asset to install.
+ *
+ * The standalone builds bundle curl_cffi, which lets yt-dlp present a real
+ * browser's TLS fingerprint. Vimeo sits behind Cloudflare, and once it has
+ * decided a client is a bot it answers 401 ("blocked due to its TLS
+ * fingerprint") to the plain Python build for every video. The `yt-dlp`
+ * zipapp has no such dependency and cannot impersonate, so it is only the
+ * fallback for platforms that have no standalone build.
+ */
+function ytDlpAssetName(): string {
+    if (process.platform === 'win32') return 'yt-dlp.exe';
+    if (process.platform === 'darwin') return 'yt-dlp_macos';
+    if (process.platform === 'linux') {
+        if (process.arch === 'x64') return 'yt-dlp_linux';
+        if (process.arch === 'arm64') return 'yt-dlp_linux_aarch64';
+    }
+    return 'yt-dlp';
+}
+
+const ASSET_NAME = ytDlpAssetName();
+// What a copy installed before the asset was recorded is: the zipapp (or the
+// exe on Windows, which was already standalone).
+const LEGACY_ASSET_NAME = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
 const MAX_REDIRECTS = 5;
 
 /**
@@ -225,6 +276,7 @@ async function installYtDlp(version: string): Promise<string> {
             await fs.move(YTDLP_PATH, PREVIOUS_YTDLP_PATH, { overwrite: true });
         }
         await fs.move(DOWNLOAD_TMP_PATH, YTDLP_PATH, { overwrite: true });
+        await writeVersionStamp(ASSET_NAME);
 
         return installedVersion;
     } finally {
@@ -244,6 +296,22 @@ async function installYtDlp(version: string): Promise<string> {
  */
 async function updateYtDlpIfStale(logger: Logger): Promise<void> {
     if (process.env.SKOOL_NO_YTDLP_UPDATE) return;
+
+    // Ahead of the once-a-day stamp and the age check: a recent copy of the
+    // wrong build is still the wrong build.
+    if (await needsAssetSwitch()) {
+        try {
+            logger.info(`⬆️  Switching to the standalone yt-dlp build (${ASSET_NAME}), which can pass Vimeo's bot checks...`);
+            const installed = await installYtDlp(await fetchLatestVersion());
+            await writeVersionStamp(ASSET_NAME);
+            logger.info(`✅ yt-dlp ${installed} installed.`);
+            return;
+        } catch (error) {
+            logger.warn(`⚠️  Could not switch yt-dlp build: ${String(error)}`);
+            logger.warn('⚠️  Continuing with the installed copy; Vimeo videos may be blocked.');
+        }
+    }
+
     if (await checkedRecently()) return;
 
     let localVersion: string;
@@ -304,7 +372,7 @@ export async function updateYtDlp(logger: Logger = createConsoleLogger()): Promi
     }
 
     const latest = await fetchLatestVersion();
-    if (from !== null && from === latest) {
+    if (from !== null && from === latest && !(await needsAssetSwitch())) {
         await writeVersionStamp();
         return { from, to: latest, changed: false };
     }
@@ -338,7 +406,9 @@ export async function rollbackYtDlp(): Promise<{ from: string | null; to: string
     }
 
     await fs.move(PREVIOUS_YTDLP_PATH, YTDLP_PATH, { overwrite: true });
-    await writeVersionStamp();
+    // The user chose this copy, so it must not be swapped for the preferred
+    // build again on the next run.
+    await writeVersionStamp(ASSET_NAME);
 
     return { from, to };
 }
@@ -510,6 +580,28 @@ async function resolveFfmpegPaths(logger: Logger): Promise<string[]> {
     return candidates.map(c => c.path);
 }
 
+const BROWSER_COOKIES_ENV = 'SKOOL_COOKIES_FROM_BROWSER';
+
+const VIMEO_BLOCK_HINT = [
+    'Vimeo (Cloudflare) is asking this client to pass a browser check that yt-dlp cannot solve.',
+    `If you can play the video in a browser on this machine, set ${BROWSER_COOKIES_ENV}=firefox (or chrome, chromium, ...)`,
+    'in the environment or in .env, after watching it there once. The tool then retries with that browser\'s cookies.'
+].join('\n');
+
+/**
+ * Vimeo's answer when Cloudflare does not let the request through: a 401, the
+ * "blocked due to its TLS fingerprint" message, or the login wall that
+ * `vimeo.com/<id>` gives. A browser passes the check; yt-dlp cannot.
+ */
+function looksLikeVimeoBlock(error: unknown): boolean {
+    const message = String(error);
+    return message.includes('[vimeo]') && (
+        message.includes('HTTP Error 401') ||
+        message.includes('TLS fingerprint') ||
+        message.includes('only works when logged-in')
+    );
+}
+
 const STALE_EXTRACTOR_HINT = [
     'This failure usually means the yt-dlp build is too old for the video host.',
     'Run `skool update` to fetch the newest yt-dlp, then try again.',
@@ -530,6 +622,28 @@ function looksLikeStaleExtractor(error: unknown): boolean {
         message.includes('Unable to extract') ||
         message.includes('SABR streaming')
     );
+}
+
+/**
+ * Vimeo only serves a domain-restricted video to its embed player, which
+ * checks the Referer, so `vimeo.com/<id>` (and `vimeo.com/<id>/<hash>` for
+ * unlisted ones) ends in "The web client only works when logged-in". Skool
+ * embeds them in a player, so ask for the player URL, as a browser would.
+ */
+export function vimeoPlayerUrl(url: string): string | null {
+    let parsed: URL;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return null;
+    }
+    if (parsed.hostname === 'player.vimeo.com') return url;
+    if (parsed.hostname !== 'vimeo.com' && parsed.hostname !== 'www.vimeo.com') return null;
+
+    const match = /^\/(?:[^/]+\/)*?(\d+)(?:\/([0-9a-f]+))?\/?$/i.exec(parsed.pathname);
+    if (!match) return null;
+    const hash = match[2] ?? parsed.searchParams.get('h');
+    return `https://player.vimeo.com/video/${match[1]}${hash ? `?h=${hash}` : ''}`;
 }
 
 /**
@@ -622,6 +736,7 @@ export class Downloader {
             const stats = fs.statSync(outputPath);
             if (stats.size > 0) {
                 this.logger.info(`    ⏭️  Video already exists, skipping download (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
+                await this.prepareTracks(outputDir, filename, await this.factsForSavedVideo(url, outputDir, filename));
                 return;
             }
         }
@@ -629,12 +744,16 @@ export class Downloader {
         const displayUrl = url.length > 100 ? url.substring(0, 97) + '...' : url;
         this.logger.info(`    ⬇️  Downloading video from ${displayUrl}`);
 
+        // Vimeo compares the Referer with the domains the video is allowed on
+        // and rejects `https://www.skool.com/` (401) while accepting the same
+        // origin without the trailing slash.
+        const vimeoUrl = vimeoPlayerUrl(url);
         const baseArgs = [
-            url,
+            vimeoUrl ?? url,
             '-o', outputPath,
             '--no-check-certificates',
             '--prefer-free-formats',
-            '--add-header', 'Referer:https://www.skool.com/',
+            '--add-header', vimeoUrl ? 'Referer:https://www.skool.com' : 'Referer:https://www.skool.com/',
             '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             '--merge-output-format', 'mp4',
             '-N', '16',
@@ -645,6 +764,247 @@ export class Downloader {
             baseArgs.push('--cookies', COOKIES_TXT_PATH);
         }
 
+        let lastError: unknown = null;
+        // Subtitles that still have to be fetched once the video is saved.
+        let pendingSubtitles: { plan: YouTubePlan; keys: string[] } | null = null;
+        // Where the tracks come from, when the host says (YouTube).
+        let facts: TrackFacts | undefined;
+        if (isYouTubeUrl(url)) {
+            baseArgs.push(...youtubeRuntimeArgs());
+            const plan = await this.planYouTube(url, baseArgs.slice(1));
+            facts = plan ? { ...plan.facts, source: url } : undefined;
+            if (plan && (plan.formatArgs.length > 0 || plan.subtitleArgs.length > 0)) {
+                try {
+                    await this.runVideoAttempts([...baseArgs, ...plan.formatArgs, ...plan.subtitleArgs], outputDir, filename);
+                    await this.prepareTracks(outputDir, filename, facts);
+                    return;
+                } catch (error) {
+                    lastError = error;
+                }
+                pendingSubtitles = plan.subtitleKeys.length > 0 ? { plan, keys: plan.subtitleKeys } : null;
+
+                // YouTube answers bursts of subtitle requests with 429, which
+                // fails the whole download. Keep the audio tracks and fetch
+                // the subtitles on their own afterwards, with pauses.
+                if (isSubtitleFailure(lastError) && plan.formatArgs.length > 0) {
+                    this.logger.warn(`    ⚠️ Subtitles failed (${summarizeVideoError(lastError)}), downloading the video without them; they are fetched afterwards`);
+                    try {
+                        await this.runVideoAttempts([...baseArgs, ...plan.formatArgs], outputDir, filename);
+                        await this.fetchSubtitlesLater(url, baseArgs.slice(1), outputDir, filename, pendingSubtitles!);
+                        await this.prepareTracks(outputDir, filename, facts);
+                        return;
+                    } catch (error) {
+                        lastError = error;
+                    }
+                }
+                // Neither subtitles nor extra audio tracks are worth losing the
+                // video for: try again as any other video.
+                this.logger.warn(`    ⚠️ ${isSubtitleFailure(lastError) ? 'Subtitles' : 'Multi-language download'} failed (${summarizeVideoError(lastError)}), retrying with the default audio only`);
+            }
+        }
+
+        try {
+            await this.runVideoAttempts(baseArgs, outputDir, filename);
+            if (pendingSubtitles) await this.fetchSubtitlesLater(url, baseArgs.slice(1), outputDir, filename, pendingSubtitles);
+            if (facts) await this.prepareTracks(outputDir, filename, facts);
+            return;
+        } catch (error) {
+            lastError = error;
+        }
+
+        // Cookies of a browser that has already passed Vimeo's check carry the
+        // Cloudflare clearance. Only read after the plain attempt was blocked,
+        // so a browser's cookie jar is not opened for every video.
+        const browser = process.env[BROWSER_COOKIES_ENV]?.trim();
+        if (vimeoUrl && browser && looksLikeVimeoBlock(lastError)) {
+            this.logger.info(`    🔁 Vimeo blocked the request, retrying with ${browser} cookies`);
+            try {
+                await this.runVideoAttempts([...baseArgs, '--cookies-from-browser', browser], outputDir, filename);
+                return;
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        this.logger.error(`Error downloading video ${displayUrl}: ${summarizeVideoError(lastError)}`);
+        if (looksLikeStaleExtractor(lastError)) {
+            this.logger.error(STALE_EXTRACTOR_HINT);
+        }
+        if (looksLikeVimeoBlock(lastError)) {
+            this.logger.error(VIMEO_BLOCK_HINT);
+        }
+        throw lastError;
+    }
+
+    /**
+     * Writes `<name>.tracks.json` (`src/media-tracks.ts`): what each audio
+     * track and subtitle is and where it came from. Browsers other than
+     * Safari play only the first audio track of an mp4, so every other one is
+     * also copied (not re-encoded) to `<name>.<lang>.m4a` for the lesson
+     * page's player. Also runs for a video that already exists, so one saved
+     * earlier gets its files; without `facts` an earlier manifest is kept.
+     * Text subtitles inside the video (Vimeo's, or from any other source)
+     * are extracted to `<name>.<lang>.vtt` when that language has no file
+     * yet, since browsers do not show them. A failure only costs the extra
+     * tracks and labels.
+     */
+    async prepareTracks(outputDir: string, filename: string, facts?: TrackFacts): Promise<void> {
+        const videoPath = path.join(outputDir, `${filename}.mp4`);
+        try {
+            // Also called when videos are skipped, before anything resolved
+            // ffmpeg.
+            if (this.ffmpegPaths.length === 0) this.ffmpegPaths = await resolveFfmpegPaths(this.logger);
+            const ffmpeg = this.ffmpegPaths[0]!;
+            // `ffmpeg -i` alone lists the streams and exits with an error, as
+            // it was given no output.
+            const probe = await execFileAsync(ffmpeg, ['-hide_banner', '-i', videoPath])
+                .then(r => r.stderr, (err: { stderr?: string }) => err.stderr ?? '');
+            const streams = (type: string) => [...probe.matchAll(new RegExp(`Stream #0:\\d+(?:\\[[^\\]]*\\])?(?:\\(([a-z]{2,3})\\))?: ${type}: (\\w+)`, 'g'))]
+                .map(m => ({ code: m[1], codec: m[2]! }));
+            const languages = streams('Audio').map(s => s.code);
+
+            const fromIso = Object.fromEntries(Object.entries(ISO_639_2).map(([two, three]) => [three, two]));
+            const used = new Set<string>();
+            const tracks = languages.map((code, i) => {
+                let lang = code && code !== 'und' ? (fromIso[code] ?? code) : 'und';
+                if (used.has(lang)) lang = `${lang}${i + 1}`;
+                used.add(lang);
+                return { lang, ...(i > 0 ? { file: `${filename}.${lang}.m4a` } : {}) };
+            });
+
+            for (const [i, track] of tracks.entries()) {
+                if (i === 0) continue;
+                const target = path.join(outputDir, track.file!);
+                if (await fs.pathExists(target)) continue;
+                const tmp = `${target}.tmp`;
+                try {
+                    // `-f mp4`: the m4a muxer only takes AAC and ALAC, and
+                    // YouTube's best audio is often Opus.
+                    await execFileAsync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-i', videoPath,
+                        '-map', `0:a:${i}`, '-c', 'copy', '-movflags', '+faststart', '-f', 'mp4', tmp]);
+                    await fs.move(tmp, target, { overwrite: true });
+                } finally {
+                    await fs.remove(tmp).catch(() => {});
+                }
+            }
+
+            // Only text formats convert to WebVTT; DVD/Blu-ray subtitles are
+            // pictures.
+            const extracted: string[] = [];
+            const textCodecs = new Set(['mov_text', 'subrip', 'srt', 'webvtt', 'ass', 'ssa', 'text']);
+            const existing = await fs.readdir(outputDir);
+            for (const [i, stream] of streams('Subtitle').entries()) {
+                if (!textCodecs.has(stream.codec)) continue;
+                const lang = stream.code && stream.code !== 'und' ? (fromIso[stream.code] ?? stream.code) : 'und';
+                const hasLanguage = existing.some(name => name.startsWith(`${filename}.`) && name.endsWith('.vtt') &&
+                    baseLanguage(name.slice(filename.length + 1, -'.vtt'.length)) === baseLanguage(lang));
+                if (hasLanguage) continue;
+                const file = `${filename}.${lang}.vtt`;
+                const tmp = path.join(outputDir, `${file}.tmp`);
+                try {
+                    await execFileAsync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-i', videoPath,
+                        '-map', `0:s:${i}`, '-c:s', 'webvtt', '-f', 'webvtt', tmp]);
+                    await fs.move(tmp, path.join(outputDir, file), { overwrite: true });
+                    existing.push(file);
+                    extracted.push(file);
+                } finally {
+                    await fs.remove(tmp).catch(() => {});
+                }
+            }
+
+            const manifest = await updateTracksManifest(outputDir, filename, tracks, facts, extracted);
+            if (manifest) {
+                const audio = manifest.audio.map(a => `${a.lang}${a.kind ? ` ${a.kind}${a.generated ? ' (auto)' : ''}` : ''}`);
+                const subs = manifest.subtitles.map(t => `${t.lang} ${t.origin}`);
+                this.logger.info(`    🎧 Tracks: audio ${audio.join(', ') || '-'}; subtitles ${subs.join(', ') || '-'}`);
+            }
+        } catch (error) {
+            this.logger.warn(`    ⚠️ Could not prepare the audio tracks and subtitles list: ${summarizeVideoError(error)}`);
+        }
+    }
+
+    /**
+     * A YouTube video saved before `<name>.tracks.json` recorded where its
+     * tracks come from: ask YouTube once (no download), so its subtitles are
+     * marked as transcription or translation rather than just automatic.
+     */
+    private async factsForSavedVideo(url: string, outputDir: string, filename: string): Promise<TrackFacts | undefined> {
+        if (!isYouTubeUrl(url)) return undefined;
+        const manifest = await readTracksManifest(outputDir, filename);
+        if (manifest?.source) return undefined;
+        const plan = await this.planYouTube(url, ['--no-check-certificates', ...youtubeRuntimeArgs()]);
+        return plan ? { ...plan.facts, source: url } : undefined;
+    }
+
+    /**
+     * Looks at a YouTube video's audio tracks and subtitles and returns the
+     * yt-dlp arguments that add those in the wanted languages
+     * (`youtubeLanguages()`). Empty when there is nothing to add or the probe
+     * fails, which only costs the extras.
+     */
+    private async planYouTube(url: string, commonArgs: string[]): Promise<YouTubePlan | null> {
+        const probeArgs = commonArgs.filter((_, i, all) => all[i] !== '-o' && all[i - 1] !== '-o');
+        let info: YouTubeInfo;
+        try {
+            const stdout: string = await this.ytDlp!.execPromise([url, '-J', '--no-playlist', ...probeArgs]);
+            info = JSON.parse(stdout) as YouTubeInfo;
+        } catch (error) {
+            this.logger.warn(`    ⚠️ Could not inspect the YouTube video's languages: ${summarizeVideoError(error)}`);
+            return null;
+        }
+
+        const plan = planYouTubeDownload(info);
+        const found = [
+            plan.audioLanguages.length >= 2 ? `audio ${plan.audioLanguages.join(' + ')}` : '',
+            plan.subtitleKeys.length > 0 ? `subtitles ${plan.subtitleKeys.join(', ')}` : ''
+        ].filter(Boolean);
+        if (found.length > 0) this.logger.info(`    🌐 YouTube: ${found.join(', ')}`);
+        return plan;
+    }
+
+    /**
+     * Fetches subtitles one language at a time, after the video, waiting out
+     * YouTube's 429s. They end up only as `<name>.<lang>.vtt` (not embedded),
+     * which is what the lesson page's player reads. Never fails the video.
+     */
+    private async fetchSubtitlesLater(
+        url: string,
+        commonArgs: string[],
+        outputDir: string,
+        filename: string,
+        pending: { plan: YouTubePlan; keys: string[] }
+    ): Promise<void> {
+        const args = commonArgs.filter((_, i, all) => all[i] !== '-o' && all[i - 1] !== '-o');
+        const waits = SUBTITLE_RETRY_DELAYS_MS;
+        for (const key of pending.keys) {
+            // `%(ext)s` rather than `.mp4`: yt-dlp names a subtitle after the
+            // video's name with its own extension replaced, and without a
+            // format chosen that extension is not mp4.
+            const output = path.join(outputDir, `${filename}.%(ext)s`);
+            for (const [attempt, wait] of waits.entries()) {
+                await new Promise(resolve => setTimeout(resolve, wait));
+                try {
+                    await this.ytDlp!.execPromise([url, '-o', output, ...args, ...pending.plan.singleSubtitleArgs(key),
+                        '--ffmpeg-location', this.ffmpegPaths[0]!]);
+                    this.logger.info(`    💬 Subtitles ${key} saved`);
+                    break;
+                } catch (error) {
+                    const last = attempt === waits.length - 1;
+                    if (last || !/429|Too Many Requests/.test(String(error))) {
+                        this.logger.warn(`    ⚠️ Subtitles ${key} not saved: ${summarizeVideoError(error)}`);
+                        break;
+                    }
+                    this.logger.info(`    ⏳ YouTube is rate limiting subtitles (429), retrying ${key} in ${Math.round(waits[attempt + 1]! / 1000)} s`);
+                }
+            }
+        }
+    }
+
+    /**
+     * Runs yt-dlp with every ffmpeg we know of until one works. Throws the last
+     * error; the caller reports it.
+     */
+    private async runVideoAttempts(baseArgs: string[], outputDir: string, filename: string): Promise<void> {
         // Without --ffmpeg-location yt-dlp cannot merge the separate video and
         // audio streams and leaves both files behind instead of one playable
         // mp4. When the merge itself crashes, retry with every other ffmpeg we
@@ -673,11 +1033,6 @@ export class Downloader {
                 if (!isPostprocessingFailure(error)) break;
                 this.logger.warn(`    ⚠️ Video merge failed with ${attempt.label}: ${summarizeVideoError(error)}`);
             }
-        }
-
-        this.logger.error(`Error downloading video ${displayUrl}: ${summarizeVideoError(lastError)}`);
-        if (looksLikeStaleExtractor(lastError)) {
-            this.logger.error(STALE_EXTRACTOR_HINT);
         }
         throw lastError;
     }

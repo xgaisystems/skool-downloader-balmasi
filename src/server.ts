@@ -27,6 +27,8 @@ const MIME_TYPES: Record<string, string> = {
     '.svg': 'image/svg+xml',
     '.mp4': 'video/mp4',
     '.webm': 'video/webm',
+    '.m4a': 'audio/mp4',
+    '.vtt': 'text/vtt; charset=utf-8',
     '.m3u8': 'application/vnd.apple.mpegurl',
     '.ts': 'video/mp2t',
     '.pdf': 'application/pdf',
@@ -255,7 +257,7 @@ export function startServer(options: ServerOptions = {}) {
 
         // Support HTTP Range requests (crucial for video scrubbing and seeking)
         const range = req.headers.range;
-        if (range && (ext === '.mp4' || ext === '.webm')) {
+        if (range && (ext === '.mp4' || ext === '.webm' || ext === '.m4a')) {
             const parts = range.replace(/bytes=/, '').split('-');
             const start = parseInt(parts[0], 10);
             const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;

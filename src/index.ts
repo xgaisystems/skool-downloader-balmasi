@@ -7,6 +7,8 @@ import { renderLessonProgressScript } from './progress-sync.js';
 import { regenerateIndex } from './regenerate-index.js';
 import { regenerateGroupIndex } from './regenerate-group-index.js';
 import { createConsoleLogger, type Logger } from './logger.js';
+import { renderVideoPlayer } from './video-player.js';
+import { findLessonVideo, readTracksManifest, tracksSummary } from './media-tracks.js';
 import fs from 'fs-extra';
 import path from 'path';
 import pLimit from 'p-limit';
@@ -88,6 +90,12 @@ type LessonManifest = {
     videoSource?: string;
     resourcesCount: number;
     linkedPosts?: LinkedPostManifest[];
+    // The video's audio tracks and subtitles with their origin (`auto-asr`,
+    // `auto-translated`, `manual`...), from video.tracks.json: what a later
+    // translation or subtitling step looks for.
+    media?: ReturnType<typeof tracksSummary>;
+    // The video's file when it is not video.mp4 (one downloaded by hand).
+    videoFile?: string;
     updatedAt: string;
 };
 
@@ -496,8 +504,19 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             let videoError: string | undefined;
                             const videoSource = lessonData.videoLink || (lessonData.videoId ? `skool:${lessonData.videoId}` : undefined);
                             const videoSkipped = Boolean(options.skipVideos && videoSource);
-                            if (options.skipVideos) {
-                                hasVideo = await fs.pathExists(path.join(lessonDir, 'video.mp4'));
+                            // `video` unless a video was put in the folder by hand
+                            // under its own name: that one is the lesson's video,
+                            // and is not downloaded again as video.mp4.
+                            const existingVideo = await findLessonVideo(lessonDir);
+                            const videoName = existingVideo ?? 'video';
+                            if (options.skipVideos || (existingVideo && existingVideo !== 'video')) {
+                                hasVideo = existingVideo !== null;
+                                // It still gets its subtitles and audio tracks in
+                                // the player.
+                                if (hasVideo) {
+                                    if (existingVideo !== 'video') logger.info(`    ⏭️  Using the video already in the folder: ${existingVideo}.mp4`);
+                                    await downloader.prepareTracks(lessonDir, videoName);
+                                }
                             } else if (lessonData.videoLink) {
                                 try {
                                     updateStatus('Downloading video...');
@@ -828,7 +847,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                     </div>
                                     <div class="container">
                                         <h1>${lessonData.title} <button type="button" class="lesson-title-tick" id="lessonTickBtn" data-lesson-id="${lessonId}" title="Marcar como realizada" aria-label="Marcar como realizada"><svg viewBox="0 0 20 20" fill="none"><path d="M4.5 10.5L8 14L15.5 5.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button></h1>
-                                        ${hasVideo ? '<video controls src="video.mp4"></video>' : ''}
+                                        ${hasVideo ? await renderVideoPlayer(lessonDir, videoName) : ''}
                                         <div class="content">
                                             ${localizedHtml}
                                         </div>
@@ -854,6 +873,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             await fs.writeFile(path.join(lessonDir, 'index.html'), htmlContent);
 
                             updateStatus('Saving metadata...');
+                            const media = hasVideo ? tracksSummary(await readTracksManifest(lessonDir, videoName)) : undefined;
                             const lessonManifest: LessonManifest = {
                                 lessonId: lesson.id,
                                 title: lesson.title,
@@ -870,6 +890,8 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                 ...(videoSkipped ? { videoSkipped, videoSource } : {}),
                                 resourcesCount: resourcesHtml.length,
                                 ...(savedPosts.length > 0 ? { linkedPosts: savedPosts.map(p => p.manifest) } : {}),
+                                ...(hasVideo && videoName !== 'video' ? { videoFile: `${videoName}.mp4` } : {}),
+                                ...(media ? { media } : {}),
                                 updatedAt: new Date().toISOString()
                             };
 
