@@ -64,7 +64,7 @@ const STALE_AFTER_DAYS = 30;
 // this stamp file extends that across runs.
 const CHECK_EVERY_HOURS = 24;
 
-type VersionStamp = { lastCheckedAt?: string };
+type VersionStamp = { lastCheckedAt?: string; asset?: string };
 
 /**
  * Reads the version yt-dlp reports for itself.
@@ -101,13 +101,35 @@ function daysSince(date: Date): number {
     return Math.floor((Date.now() - date.getTime()) / (1000 * 60 * 60 * 24));
 }
 
-async function writeVersionStamp(): Promise<void> {
+async function readVersionStamp(): Promise<VersionStamp> {
     try {
-        const stamp: VersionStamp = { lastCheckedAt: new Date().toISOString() };
+        return ((await fs.readJson(VERSION_STAMP_PATH)) as VersionStamp) ?? {};
+    } catch {
+        return {};
+    }
+}
+
+/**
+ * `asset` is passed only when a binary was just put in place; otherwise the
+ * asset recorded by the last install is kept.
+ */
+async function writeVersionStamp(asset?: string): Promise<void> {
+    try {
+        const previous = await readVersionStamp();
+        const stamp: VersionStamp = {
+            lastCheckedAt: new Date().toISOString(),
+            asset: asset ?? previous.asset
+        };
         await fs.writeJson(VERSION_STAMP_PATH, stamp);
     } catch {
         // A stamp that cannot be written only costs one extra check next run.
     }
+}
+
+/** True when the installed binary is a different build than the one wanted. */
+async function needsAssetSwitch(): Promise<boolean> {
+    const stamp = await readVersionStamp();
+    return (stamp.asset ?? LEGACY_ASSET_NAME) !== ASSET_NAME;
 }
 
 async function checkedRecently(): Promise<boolean> {
@@ -149,7 +171,30 @@ async function fetchLatestVersion(): Promise<string> {
     return tag;
 }
 
-const ASSET_NAME = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+/**
+ * Which yt-dlp release asset to install.
+ *
+ * The standalone builds bundle curl_cffi, which lets yt-dlp present a real
+ * browser's TLS fingerprint. Vimeo sits behind Cloudflare, and once it has
+ * decided a client is a bot it answers 401 ("blocked due to its TLS
+ * fingerprint") to the plain Python build for every video. The `yt-dlp`
+ * zipapp has no such dependency and cannot impersonate, so it is only the
+ * fallback for platforms that have no standalone build.
+ */
+function ytDlpAssetName(): string {
+    if (process.platform === 'win32') return 'yt-dlp.exe';
+    if (process.platform === 'darwin') return 'yt-dlp_macos';
+    if (process.platform === 'linux') {
+        if (process.arch === 'x64') return 'yt-dlp_linux';
+        if (process.arch === 'arm64') return 'yt-dlp_linux_aarch64';
+    }
+    return 'yt-dlp';
+}
+
+const ASSET_NAME = ytDlpAssetName();
+// What a copy installed before the asset was recorded is: the zipapp (or the
+// exe on Windows, which was already standalone).
+const LEGACY_ASSET_NAME = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
 const MAX_REDIRECTS = 5;
 
 /**
@@ -225,6 +270,7 @@ async function installYtDlp(version: string): Promise<string> {
             await fs.move(YTDLP_PATH, PREVIOUS_YTDLP_PATH, { overwrite: true });
         }
         await fs.move(DOWNLOAD_TMP_PATH, YTDLP_PATH, { overwrite: true });
+        await writeVersionStamp(ASSET_NAME);
 
         return installedVersion;
     } finally {
@@ -244,6 +290,22 @@ async function installYtDlp(version: string): Promise<string> {
  */
 async function updateYtDlpIfStale(logger: Logger): Promise<void> {
     if (process.env.SKOOL_NO_YTDLP_UPDATE) return;
+
+    // Ahead of the once-a-day stamp and the age check: a recent copy of the
+    // wrong build is still the wrong build.
+    if (await needsAssetSwitch()) {
+        try {
+            logger.info(`⬆️  Switching to the standalone yt-dlp build (${ASSET_NAME}), which can pass Vimeo's bot checks...`);
+            const installed = await installYtDlp(await fetchLatestVersion());
+            await writeVersionStamp(ASSET_NAME);
+            logger.info(`✅ yt-dlp ${installed} installed.`);
+            return;
+        } catch (error) {
+            logger.warn(`⚠️  Could not switch yt-dlp build: ${String(error)}`);
+            logger.warn('⚠️  Continuing with the installed copy; Vimeo videos may be blocked.');
+        }
+    }
+
     if (await checkedRecently()) return;
 
     let localVersion: string;
@@ -304,7 +366,7 @@ export async function updateYtDlp(logger: Logger = createConsoleLogger()): Promi
     }
 
     const latest = await fetchLatestVersion();
-    if (from !== null && from === latest) {
+    if (from !== null && from === latest && !(await needsAssetSwitch())) {
         await writeVersionStamp();
         return { from, to: latest, changed: false };
     }
@@ -338,7 +400,9 @@ export async function rollbackYtDlp(): Promise<{ from: string | null; to: string
     }
 
     await fs.move(PREVIOUS_YTDLP_PATH, YTDLP_PATH, { overwrite: true });
-    await writeVersionStamp();
+    // The user chose this copy, so it must not be swapped for the preferred
+    // build again on the next run.
+    await writeVersionStamp(ASSET_NAME);
 
     return { from, to };
 }
@@ -510,6 +574,28 @@ async function resolveFfmpegPaths(logger: Logger): Promise<string[]> {
     return candidates.map(c => c.path);
 }
 
+const BROWSER_COOKIES_ENV = 'SKOOL_COOKIES_FROM_BROWSER';
+
+const VIMEO_BLOCK_HINT = [
+    'Vimeo (Cloudflare) is asking this client to pass a browser check that yt-dlp cannot solve.',
+    `If you can play the video in a browser on this machine, set ${BROWSER_COOKIES_ENV}=firefox (or chrome, chromium, ...)`,
+    'in the environment or in .env, after watching it there once. The tool then retries with that browser\'s cookies.'
+].join('\n');
+
+/**
+ * Vimeo's answer when Cloudflare does not let the request through: a 401, the
+ * "blocked due to its TLS fingerprint" message, or the login wall that
+ * `vimeo.com/<id>` gives. A browser passes the check; yt-dlp cannot.
+ */
+function looksLikeVimeoBlock(error: unknown): boolean {
+    const message = String(error);
+    return message.includes('[vimeo]') && (
+        message.includes('HTTP Error 401') ||
+        message.includes('TLS fingerprint') ||
+        message.includes('only works when logged-in')
+    );
+}
+
 const STALE_EXTRACTOR_HINT = [
     'This failure usually means the yt-dlp build is too old for the video host.',
     'Run `skool update` to fetch the newest yt-dlp, then try again.',
@@ -530,6 +616,28 @@ function looksLikeStaleExtractor(error: unknown): boolean {
         message.includes('Unable to extract') ||
         message.includes('SABR streaming')
     );
+}
+
+/**
+ * Vimeo only serves a domain-restricted video to its embed player, which
+ * checks the Referer, so `vimeo.com/<id>` (and `vimeo.com/<id>/<hash>` for
+ * unlisted ones) ends in "The web client only works when logged-in". Skool
+ * embeds them in a player, so ask for the player URL, as a browser would.
+ */
+export function vimeoPlayerUrl(url: string): string | null {
+    let parsed: URL;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return null;
+    }
+    if (parsed.hostname === 'player.vimeo.com') return url;
+    if (parsed.hostname !== 'vimeo.com' && parsed.hostname !== 'www.vimeo.com') return null;
+
+    const match = /^\/(?:[^/]+\/)*?(\d+)(?:\/([0-9a-f]+))?\/?$/i.exec(parsed.pathname);
+    if (!match) return null;
+    const hash = match[2] ?? parsed.searchParams.get('h');
+    return `https://player.vimeo.com/video/${match[1]}${hash ? `?h=${hash}` : ''}`;
 }
 
 /**
@@ -629,12 +737,16 @@ export class Downloader {
         const displayUrl = url.length > 100 ? url.substring(0, 97) + '...' : url;
         this.logger.info(`    ⬇️  Downloading video from ${displayUrl}`);
 
+        // Vimeo compares the Referer with the domains the video is allowed on
+        // and rejects `https://www.skool.com/` (401) while accepting the same
+        // origin without the trailing slash.
+        const vimeoUrl = vimeoPlayerUrl(url);
         const baseArgs = [
-            url,
+            vimeoUrl ?? url,
             '-o', outputPath,
             '--no-check-certificates',
             '--prefer-free-formats',
-            '--add-header', 'Referer:https://www.skool.com/',
+            '--add-header', vimeoUrl ? 'Referer:https://www.skool.com' : 'Referer:https://www.skool.com/',
             '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             '--merge-output-format', 'mp4',
             '-N', '16',
@@ -645,6 +757,43 @@ export class Downloader {
             baseArgs.push('--cookies', COOKIES_TXT_PATH);
         }
 
+        let lastError: unknown = null;
+        try {
+            await this.runVideoAttempts(baseArgs, outputDir, filename);
+            return;
+        } catch (error) {
+            lastError = error;
+        }
+
+        // Cookies of a browser that has already passed Vimeo's check carry the
+        // Cloudflare clearance. Only read after the plain attempt was blocked,
+        // so a browser's cookie jar is not opened for every video.
+        const browser = process.env[BROWSER_COOKIES_ENV]?.trim();
+        if (vimeoUrl && browser && looksLikeVimeoBlock(lastError)) {
+            this.logger.info(`    🔁 Vimeo blocked the request, retrying with ${browser} cookies`);
+            try {
+                await this.runVideoAttempts([...baseArgs, '--cookies-from-browser', browser], outputDir, filename);
+                return;
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        this.logger.error(`Error downloading video ${displayUrl}: ${summarizeVideoError(lastError)}`);
+        if (looksLikeStaleExtractor(lastError)) {
+            this.logger.error(STALE_EXTRACTOR_HINT);
+        }
+        if (looksLikeVimeoBlock(lastError)) {
+            this.logger.error(VIMEO_BLOCK_HINT);
+        }
+        throw lastError;
+    }
+
+    /**
+     * Runs yt-dlp with every ffmpeg we know of until one works. Throws the last
+     * error; the caller reports it.
+     */
+    private async runVideoAttempts(baseArgs: string[], outputDir: string, filename: string): Promise<void> {
         // Without --ffmpeg-location yt-dlp cannot merge the separate video and
         // audio streams and leaves both files behind instead of one playable
         // mp4. When the merge itself crashes, retry with every other ffmpeg we
@@ -673,11 +822,6 @@ export class Downloader {
                 if (!isPostprocessingFailure(error)) break;
                 this.logger.warn(`    ⚠️ Video merge failed with ${attempt.label}: ${summarizeVideoError(error)}`);
             }
-        }
-
-        this.logger.error(`Error downloading video ${displayUrl}: ${summarizeVideoError(lastError)}`);
-        if (looksLikeStaleExtractor(lastError)) {
-            this.logger.error(STALE_EXTRACTOR_HINT);
         }
         throw lastError;
     }

@@ -57,6 +57,10 @@ The goal of this project is to provide a robust, platform-independent tool for c
 17. **Being Gentle with Skool**:
    Skool detects automated traffic and can cut an account's access. Keep lesson concurrency modest, keep the delays between navigations (`POST_NAVIGATION_DELAY_MS`, the waits in `extractLessonData()`), and never test against skool.com in loops: stub `Scraper`/`Downloader` methods for orchestration tests and use a local HTTP server for download tests.
 
+18. **Vimeo Videos**:
+   Skool lessons embed Vimeo videos that are restricted to certain domains. `vimeo.com/<id>` answers "The web client only works when logged-in" even with cookies, because only the embed player honours the Referer. `downloadVideo()` therefore rewrites Vimeo URLs with `vimeoPlayerUrl()` (`https://player.vimeo.com/video/<id>?h=<hash>`) and sends `Referer:https://www.skool.com` **without the trailing slash**: with the slash Vimeo answers 401 (checked with yt-dlp 2026.10.21). Other hosts keep the slash.
+   **Cloudflare also blocks yt-dlp's TLS fingerprint**: after a burst of requests Vimeo answers 401 / "blocked due to its TLS fingerprint" to every video, including ones that worked minutes earlier (a real browser passes the Turnstile challenge). The Python `yt-dlp` zipapp cannot impersonate a browser; the standalone builds bundle `curl_cffi`, and yt-dlp uses it on its own. `ytDlpAssetName()` therefore installs `yt-dlp_linux` / `yt-dlp_linux_aarch64` / `yt-dlp_macos` / `yt-dlp.exe`, falling back to the zipapp only on other platforms. The asset is recorded in `.yt-dlp-check.json`; a copy installed with a different asset (anything installed before this) is replaced on the next run, ahead of the age and once-a-day checks, and a failed switch only warns. Same file name `yt-dlp` in the cache folder.
+
 ## Project Structure
 - `src/auth.ts`: Handles the manual login flow and cookie conversion.
 - `src/scraper.ts`: Navigates the course tree and parses lesson metadata from Next.js state.
